@@ -14,7 +14,7 @@ const (
 	DefaultMinReplicas = 1
 
 	// DefaultMaxReplicas is the amount of replicas a service will auto-scale up to.
-	DefaultMaxReplicas = 5
+	DefaultMaxReplicas = 50
 
 	// DefaultScalingFactor is the defining proportion for the scaling increments.
 	DefaultScalingFactor = 10
