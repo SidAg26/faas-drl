@@ -35,14 +35,27 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		writeRequestURI = exists
 	}
 
+	// This creates a *httputil.ReverseProxy configured to rewrite requests using the provided resolvers
+	// For regular requests, the code builds and sends the upstream request manually, but for event streams, 
+	// it delegates to the reverse proxy created by makeRewriteProxy.
 	reverseProxy := makeRewriteProxy(baseURLResolver, urlPathTransformer)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 
+		// Resolve the base URL for the request
+		// This function determines the base URL (host and port) of the backend service 
+		// (function) that should handle the request, based on the incoming HTTP request r
+		// The logic for resolving the backend is implemented in the BaseURLResolver 
+		// interface (from middleware.BaseURLResolver), which is passed in as a parameter to 
+		// MakeForwardingProxyHandler.
+		// This resolver typically uses information from the request (such as the function 
+		// name in the path) to map to the correct backend service
 		baseURL := baseURLResolver.Resolve(r)
 		originalURL := r.URL.String()
+		// This function transforms the incoming request path to the path expected by the backend.
 		requestURL := urlPathTransformer.Transform(r)
 
+		// All registered notifiers are notified that the request has started processing.
 		for _, notifier := range notifiers {
 			notifier.Notify(r.Method, requestURL, originalURL, http.StatusProcessing, "started", time.Second*0)
 		}
@@ -56,6 +69,8 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 
 		seconds := time.Since(start)
 
+		// All notifiers are notified that the request has completed, 
+		// along with the status code and duration
 		for _, notifier := range notifiers {
 			notifier.Notify(r.Method, requestURL, originalURL, statusCode, "completed", seconds)
 		}
@@ -102,7 +117,13 @@ func forwardRequest(w http.ResponseWriter,
 	if r.Body != nil {
 		defer r.Body.Close()
 	}
-
+	// The backend is specified by the combination of baseURL (from the resolver) 
+	// and requestURL (from the transformer) and then the actual request is built
+	// using the buildUpstreamRequest function. This function creates a new HTTP request
+	// with the method, URL, and headers from the original request, but modifies the URL
+	// to point to the backend service. It also copies headers from the original request
+	// to the new request, while removing any hop-by-hop headers that should not be sent
+	// to the backend.
 	upstreamReq := buildUpstreamRequest(r, baseURL, requestURL)
 
 	if serviceAuthInjector != nil {
@@ -121,6 +142,7 @@ func forwardRequest(w http.ResponseWriter,
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
+	// sends the request to the backend using the HTTP client
 	res, err := proxyClient.Do(upstreamReq.WithContext(ctx))
 	if err != nil {
 		badStatus := http.StatusBadGateway
