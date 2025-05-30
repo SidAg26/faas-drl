@@ -24,8 +24,9 @@ func MakeNotifierWrapper(next http.HandlerFunc, notifiers []HTTPNotifier) http.H
 		writer := httputil.NewHttpWriteInterceptor(w)
 		next(writer, r)
 
+		// SA - incldue the X-Request-ID header in the notification for custom tracking
 		for _, notifier := range notifiers {
-			notifier.Notify(r.Method, url, url, writer.Status(), "completed", time.Since(then))
+			notifier.Notify(r.Header.Get("X-Request-ID"), r.Method, url, url, writer.Status(), "completed", time.Since(then))
 		}
 	}
 }

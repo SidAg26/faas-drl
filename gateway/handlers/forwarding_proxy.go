@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	// SA - uuid is used for generating unique identifiers
+	// "github.com/google/uuid"
+	"crypto/rand"
 
 	fhttputil "github.com/openfaas/faas-provider/httputil"
 	"github.com/openfaas/faas/gateway/pkg/middleware"
@@ -55,9 +58,15 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		// This function transforms the incoming request path to the path expected by the backend.
 		requestURL := urlPathTransformer.Transform(r)
 
+
+		// SA - Generate a unique request ID for tracing purposes
+		// This request ID is set in the "X-Request-ID" header of the request
+		// and is used to track the request through the system.
+		reqID := randomID()
+		r.Header.Set("X-Request-ID", reqID)
 		// All registered notifiers are notified that the request has started processing.
 		for _, notifier := range notifiers {
-			notifier.Notify(r.Method, requestURL, originalURL, http.StatusProcessing, "started", time.Second*0)
+			notifier.Notify(reqID, r.Method, requestURL, originalURL, http.StatusProcessing, "started", time.Second*0)
 		}
 
 		start := time.Now()
@@ -72,10 +81,19 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		// All notifiers are notified that the request has completed, 
 		// along with the status code and duration
 		for _, notifier := range notifiers {
-			notifier.Notify(r.Method, requestURL, originalURL, statusCode, "completed", seconds)
+			notifier.Notify(reqID, r.Method, requestURL, originalURL, statusCode, "completed", seconds)
 		}
 	}
 }
+
+// SA - randomID generates a random ID for tracing purposes
+// This function generates a random 16-byte ID and returns it as a hexadecimal string.
+func randomID() string {
+    b := make([]byte, 16)
+    rand.Read(b)
+    return fmt.Sprintf("%x", b)
+}
+
 
 func buildUpstreamRequest(r *http.Request, baseURL string, requestURL string) *http.Request {
 	url := baseURL + requestURL

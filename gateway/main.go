@@ -79,12 +79,19 @@ func main() {
 
 	loggingNotifier := handlers.LoggingNotifier{}
 
+	// SA - Custom notifier to record function metrics
+	CustomNotifier := handlers.NewCustomLoggingNotifier()
+
 	prometheusNotifier := handlers.PrometheusFunctionNotifier{
 		Metrics:           &metricsOptions,
 		FunctionNamespace: config.Namespace,
 	}
 
-	functionNotifiers := []handlers.HTTPNotifier{loggingNotifier, prometheusNotifier}
+	// SA - Custom notifier to record function metrics
+	functionNotifiers := []handlers.HTTPNotifier{loggingNotifier, prometheusNotifier, CustomNotifier}
+	// SA - not the forwarding notifiers, these are used for the gateway itself
+	// forwardingNotifiers are used for the gateway itself, e.g. /system/info
+	// and /system/functions, these are not function-specific.
 	forwardingNotifiers := []handlers.HTTPNotifier{loggingNotifier}
 	quietNotifier := []handlers.HTTPNotifier{}
 
@@ -144,7 +151,9 @@ func main() {
 	faasHandlers.LogProxyHandler = handlers.NewLogHandlerFunc(*config.LogsProviderURL, config.WriteTimeout)
 
 	functionProxy := faasHandlers.Proxy
-
+	
+	// If ScaleFromZero is enabled, wrap the function proxy with a scaling handler
+	// which will scale the function from zero to N replicas if it is not already available.
 	if config.ScaleFromZero {
 		scalingFunctionCache := scaling.NewFunctionCache(scalingConfig.CacheExpiry)
 		scaler := scaling.NewFunctionScaler(scalingConfig, scalingFunctionCache)
