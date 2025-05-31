@@ -11,6 +11,8 @@ package handlers
 import (
 	"net/http"
 	"time"
+	// SA - strconv is used for converting status codes to strings
+	"strconv"
 
 	"github.com/openfaas/faas-provider/httputil"
 )
@@ -26,7 +28,10 @@ func MakeNotifierWrapper(next http.HandlerFunc, notifiers []HTTPNotifier) http.H
 
 		// SA - incldue the X-Request-ID header in the notification for custom tracking
 		for _, notifier := range notifiers {
-			notifier.Notify(r.Header.Get("X-Request-ID"), r.Method, url, url, writer.Status(), "completed", time.Since(then))
+			// SA - use the string representation of the status code
+			code := strconv.Itoa(writer.Status())
+			// SA - notifier.Notify(r.Header.Get("X-Request-ID"), r.Method, url, url, writer.Status(), "completed", time.Since(then))
+			notifier.Notify(r.Header.Get("X-Request-ID"), r.Method, url, url, code, "completed", time.Since(then))
 		}
 	}
 }

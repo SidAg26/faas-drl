@@ -21,8 +21,9 @@ import (
 // SA - custom HTTPNotifier interface
 // HTTPNotifier interface defines a method to notify about HTTP requests and responses
 // It includes details such as request ID, HTTP method, URL, original URL, status code, event type, and duration
+// Change the statusCode type from int to string to accommodate custom status codes
 type HTTPNotifier interface {
-    Notify(requestID string, method string, URL string, originalURL string, statusCode int, event string, duration time.Duration)
+    Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration)
 }
 
 func urlToLabel(path string) string {
@@ -42,9 +43,9 @@ type PrometheusFunctionNotifier struct {
 	FunctionNamespace string
 }
 
-// SA - Include the requestId in the interface
+// SA - Include the requestId in the interface and add a new parameter for statusCode
 // Notify records metrics in Prometheus
-func (p PrometheusFunctionNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode int, event string, duration time.Duration) {
+func (p PrometheusFunctionNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration) {
 	serviceName := middleware.GetServiceName(originalURL)
 	if len(p.FunctionNamespace) > 0 {
 		if !strings.Contains(serviceName, ".") {
@@ -52,7 +53,10 @@ func (p PrometheusFunctionNotifier) Notify(requestID string, method string, URL 
 		}
 	}
 
-	code := strconv.Itoa(statusCode)
+	// SA - Extract status code and IP from statusCode string
+	parts := strings.Split(statusCode, "+")
+	code := parts[0]
+	// code := strconv.Itoa(statusCode)
 	labels := prometheus.Labels{"function_name": serviceName, "code": code}
 
 	if event == "completed" {
@@ -76,8 +80,11 @@ type LoggingNotifier struct {
 
 // SA - Include the requestId in the interface
 // Notify the LoggingNotifier about a request
-func (LoggingNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode int, event string, duration time.Duration) {
+func (LoggingNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration) {
 	if event == "completed" {
+		// SA - Extract status code and IP from statusCode string
+		parts := strings.Split(statusCode, "+")
+		statusCode, _ := strconv.Atoi(parts[0])
 		log.Printf("Forwarded [%s] to %s - [%d] - %.4fs", method, originalURL, statusCode, duration.Seconds())
 	}
 }
@@ -106,7 +113,7 @@ func NewCustomLoggingNotifier() *CustomLoggingNotifier {
 }
 
 // SA - Include the requestId in the interface
-func (n *CustomLoggingNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode int, event string, duration time.Duration) {
+func (n *CustomLoggingNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration) {
     // requestID := fmt.Sprintf("%s-%s-%d", method, originalURL, time.Now().UnixNano())
 
     n.mu.Lock()
@@ -121,11 +128,17 @@ func (n *CustomLoggingNotifier) Notify(requestID string, method string, URL stri
         if !ok {
             startTime = endTime.Add(-duration)
         }
-        log.Printf("[CustomNotifier] END: ID=%s Method=%s Path=%s Status=%d Start=%s End=%s Duration=%.4fs",
+		// SA - Extract status code and IP from StatusIP string
+        parts := strings.Split(statusCode, "+")
+        statusCode, _ := strconv.Atoi(parts[0])
+        backendIP := parts[1]
+
+        log.Printf("[CustomNotifier] END: ID=%s Method=%s Path=%s Status=%d Start=%s End=%s Duration=%.4fs BackendIP=%s",
             requestID, method, originalURL, statusCode,
             startTime.Format(time.RFC3339Nano),
             endTime.Format(time.RFC3339Nano),
-            duration.Seconds())
+            duration.Seconds(),
+			backendIP)
         delete(n.requests, requestID)
     }
 }

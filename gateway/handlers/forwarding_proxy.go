@@ -19,7 +19,9 @@ import (
 	"time"
 	// SA - uuid is used for generating unique identifiers
 	// "github.com/google/uuid"
+	// SA - strconv is used for converting status codes to strings
 	"crypto/rand"
+	"strconv"
 
 	fhttputil "github.com/openfaas/faas-provider/httputil"
 	"github.com/openfaas/faas/gateway/pkg/middleware"
@@ -66,7 +68,10 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		r.Header.Set("X-Request-ID", reqID)
 		// All registered notifiers are notified that the request has started processing.
 		for _, notifier := range notifiers {
-			notifier.Notify(reqID, r.Method, requestURL, originalURL, http.StatusProcessing, "started", time.Second*0)
+			// SA - Notify the notifiers that the request has started processing as string
+			code := strconv.Itoa(http.StatusProcessing)
+			// SA - notifier.Notify(reqID, r.Method, requestURL, originalURL, http.StatusProcessing, "started", time.Second*0)
+			notifier.Notify(reqID, r.Method, requestURL, originalURL, code, "started", time.Second*0)
 		}
 
 		start := time.Now()
@@ -122,6 +127,7 @@ func buildUpstreamRequest(r *http.Request, baseURL string, requestURL string) *h
 	return upstreamReq
 }
 
+// SA - update the function signature to include the string return type for status code
 func forwardRequest(w http.ResponseWriter,
 	r *http.Request,
 	proxyClient *http.Client,
@@ -130,7 +136,7 @@ func forwardRequest(w http.ResponseWriter,
 	timeout time.Duration,
 	writeRequestURI bool,
 	serviceAuthInjector middleware.AuthInjector,
-	reverseProxy *httputil.ReverseProxy) (int, error) {
+	reverseProxy *httputil.ReverseProxy) (string, error) {
 
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -153,8 +159,10 @@ func forwardRequest(w http.ResponseWriter,
 	}
 
 	if strings.HasPrefix(r.Header.Get("Accept"), "text/event-stream") {
-
-		return handleEventStream(w, r, reverseProxy, upstreamReq, timeout)
+		// SA - update the handleEventStream function to return a string status code
+		// return handleEventStream(w, r, reverseProxy, upstreamReq, timeout)
+		statusCode, err := handleEventStream(w, r, reverseProxy, upstreamReq, timeout)
+		return strconv.Itoa(statusCode), err
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
@@ -165,7 +173,9 @@ func forwardRequest(w http.ResponseWriter,
 	if err != nil {
 		badStatus := http.StatusBadGateway
 		w.WriteHeader(badStatus)
-		return badStatus, err
+		// SA - update the badStatus to a string
+		badStatusStr := strconv.Itoa(badStatus)
+		return badStatusStr, err
 	}
 
 	if res.Body != nil {
@@ -180,7 +190,14 @@ func forwardRequest(w http.ResponseWriter,
 		io.Copy(w, res.Body)
 	}
 
-	return res.StatusCode, nil
+	// SA - return the "res.StatusCode + X-OpenFaaS-Backend-IP" to indicate the status 
+	// and the Pod IP of the request
+	code := strconv.Itoa(res.StatusCode)
+	// SA - Get the service IP from the response header
+	serviceIP := res.Header.Get("X-OpenFaaS-Backend-IP")
+	statusCode := code + "+" + serviceIP
+
+	return statusCode, nil
 }
 
 func handleEventStream(w http.ResponseWriter, r *http.Request, reverseProxy *httputil.ReverseProxy, upstreamReq *http.Request, timeout time.Duration) (int, error) {
