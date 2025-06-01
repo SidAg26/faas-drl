@@ -4,6 +4,10 @@
 // Copyright (c) Alex Ellis 2017. All rights reserved.
 
 package plugin
+// SA - This package is used as an interface for the gateway 
+// to query external providers like faas-netes in our case for
+// scaling and querying function metadata. It uses HTTP to communicate
+// with the external service and handles authentication if needed.
 
 import (
 	"bytes"
