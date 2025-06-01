@@ -29,6 +29,17 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
 - **Vendor update**:
   - Ran `go mod vendor` after changing `go.mod` to sync dependencies.
 
+- **Request Routing & Round-Robin Selection**:
+  - Refactored request routing logic in `pkg/k8s/proxy.go` to support round-robin selection of backend pods for each function.
+  - Introduced a new `round_robin.go` module to encapsulate round-robin state and logic, ensuring thread-safe and modular selection of pods.
+  - Updated `FunctionLookup` to use the new `RoundRobinSelector` for backend pod selection.
+  - Ensured round-robin logic is robust to autoscaling events (pod count changes), always selecting a valid pod index.
+  - Added comments and improved logging for request routing decisions (with recommendations for production log levels).
+
+- **Request Routing Suggestions**:
+  - Documented and implemented strategies for request routing, including round-robin, with placeholders for future strategies (least connections, weighted, etc.).
+  - Modularized routing logic for easier extension and testing.
+
 ### faas-drl/gateway
 
 - **Enhanced notifiers and logging**:
@@ -96,6 +107,12 @@ kind load docker-image <your-dockerhub-username>/faas-netes:custom --name kind
 - **Pod IP tracking**:  
   The `X-OpenFaaS-Backend-IP` header is now set in both requests to the function pod and responses to the client/gateway for easier tracing.
 
+- **Round-robin pod selection**:  
+  The round-robin selector is now modular and robust to autoscaling events. If the number of pods changes, the selector resets or advances as needed to always select a valid backend.
+
+- **Request routing strategies**:  
+  The codebase is now structured to allow easy addition of new routing strategies (e.g., least connections, weighted, etc.) in the future.
+
 ---
 
 ## 5. Purpose of Changes
@@ -108,6 +125,9 @@ kind load docker-image <your-dockerhub-username>/faas-netes:custom --name kind
 
 - **Consistent deployment**:  
   Documented build and deployment steps ensure you can reliably reproduce your environment and changes in the future.
+
+- **Improved request routing**:  
+  Round-robin and modular routing logic provide fairer load distribution and a foundation for advanced routing features.
 
 ---
 
