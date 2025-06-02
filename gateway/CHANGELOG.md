@@ -40,6 +40,14 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
   - Documented and implemented strategies for request routing, including round-robin, with placeholders for future strategies (least connections, weighted, etc.).
   - Modularized routing logic for easier extension and testing.
 
+- **Pod Status Cache & Pod Status Marking**
+  - Added a **pod status cache** to track the status (busy/idle) of function pods.
+  - Implemented a `PodStatusCache` type and integrated it into `FunctionLookup` in `pkg/k8s/`.
+  - Updated `proxy.go` to update the pod status cache whenever a pod is selected for a request.
+  - Added new methods to `FunctionLookup` for querying and updating pod statuses.
+  - Registered a new HTTP handler for `/system/podstatus/{status}` in the provider's router (see `main.go`), using `handlers.MakePodIdleHandler`.
+  - Ensured the provider exposes this endpoint so the gateway can mark pods as busy or idle.
+
 ### faas-drl/gateway
 
 - **Enhanced notifiers and logging**:
@@ -50,6 +58,19 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
 - **Gateway configuration**:
   - Verified and documented the use of `functions_provider_url` for correct provider routing.
   - Noted that `127.0.0.1:8081` only works if provider and gateway are in the same container; otherwise, use the Kubernetes service DNS name.
+
+- **Pod Status Cache & Pod Status Marking**
+  - Added a **PodStatusPlugin** in `plugin/pod_status.go` to send pod status updates (busy/idle) to the provider.
+  - The plugin sends POST requests to `/system/podstatus/{status}` with pod name and IP in the JSON body.
+  - Integrated the plugin into the request forwarding logic (`handlers/forwarding_proxy.go`), so pods are marked as busy before a request and idle after completion.
+  - Updated notifier and logging logic to include pod status transitions for observability.
+  - Ensured the gateway is configurable to point to the correct provider URL for pod status updates.
+
+### faas-provider-openfaas
+
+- **Pod Status Cache & Pod Status Marking**
+  - Updated the `types` compatible with the PodStatusCahcing and PodStatusUpdater interface and methods
+  - (If used as a base for the provider) Ensured the `serve.go` and router setup allow for custom handler registration, including `/system/podstatus/{status}`.
 
 ---
 
@@ -90,6 +111,12 @@ If you are using KinD for local development, you can load the image directly:
 ```sh
 kind load docker-image <your-dockerhub-username>/faas-netes:custom --name kind
 ```
+For the Pod Status Caching and Pod Status Marking:
+
+- Build and push Docker images for any changed components, and update your Kubernetes deployments.
+- The provider and gateway must both be rebuilt and redeployed for pod status tracking to work end-to-end.
+- The provider must expose `/system/podstatus/{status}` and update its internal pod status cache accordingly.
+
 
 ---
 
@@ -128,6 +155,9 @@ kind load docker-image <your-dockerhub-username>/faas-netes:custom --name kind
 
 - **Improved request routing**:  
   Round-robin and modular routing logic provide fairer load distribution and a foundation for advanced routing features.
+
+- **Pod Status Cache and Pod Status Marking**
+  These changes enable the OpenFaaS gateway to track and update the status of function pods (busy/idle) in real time, improving scheduling, observability, and future scaling strategies.
 
 ---
 
