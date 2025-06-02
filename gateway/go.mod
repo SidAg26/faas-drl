@@ -2,6 +2,8 @@ module github.com/openfaas/faas/gateway
 
 go 1.23
 
+toolchain go1.23.9
+
 require (
 	github.com/docker/distribution v2.8.3+incompatible
 	github.com/gorilla/mux v1.8.1
@@ -13,7 +15,8 @@ require (
 	golang.org/x/sync v0.10.0
 )
 
-// replace github.com/openfaas/faas-provider => ../../faas-provider
+// SA - redirect faas-provider to local directory for development
+replace github.com/openfaas/faas-provider => /home/ubuntu/memFigLessDIR/faas-provider-openfaas
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -30,11 +33,11 @@ require (
 	github.com/nats-io/nkeys v0.4.8 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/nats-io/stan.go v0.10.4 // indirect
-	github.com/prometheus/common v0.61.0 // indirect
+	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	go.etcd.io/bbolt v1.3.11 // indirect
 	golang.org/x/crypto v0.30.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/sys v0.29.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
-	google.golang.org/protobuf v1.35.2 // indirect
+	google.golang.org/protobuf v1.36.4 // indirect
 )
