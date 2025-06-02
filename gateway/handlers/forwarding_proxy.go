@@ -17,11 +17,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	// SA - uuid is used for generating unique identifiers
 	// "github.com/google/uuid"
 	// SA - strconv is used for converting status codes to strings
 	"crypto/rand"
 	"strconv"
+
+	// SA - plugin is used for updating the pod status
+	"github.com/openfaas/faas/gateway/plugin"
 
 	fhttputil "github.com/openfaas/faas-provider/httputil"
 	"github.com/openfaas/faas/gateway/pkg/middleware"
@@ -33,7 +37,9 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 	notifiers []HTTPNotifier,
 	baseURLResolver middleware.BaseURLResolver,
 	urlPathTransformer middleware.URLPathTransformer,
-	serviceAuthInjector middleware.AuthInjector) http.HandlerFunc {
+	serviceAuthInjector middleware.AuthInjector,
+	podStatusUpdater *plugin.PodStatusPlugin, // SA - add the podStatusUpdater to update the pod status
+) http.HandlerFunc {
 
 	writeRequestURI := false
 	if _, exists := os.LookupEnv("write_request_uri"); exists {
@@ -41,25 +47,24 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 	}
 
 	// This creates a *httputil.ReverseProxy configured to rewrite requests using the provided resolvers
-	// For regular requests, the code builds and sends the upstream request manually, but for event streams, 
+	// For regular requests, the code builds and sends the upstream request manually, but for event streams,
 	// it delegates to the reverse proxy created by makeRewriteProxy.
 	reverseProxy := makeRewriteProxy(baseURLResolver, urlPathTransformer)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		// Resolve the base URL for the request
-		// This function determines the base URL (host and port) of the backend service 
+		// This function determines the base URL (host and port) of the backend service
 		// (function) that should handle the request, based on the incoming HTTP request r
-		// The logic for resolving the backend is implemented in the BaseURLResolver 
-		// interface (from middleware.BaseURLResolver), which is passed in as a parameter to 
+		// The logic for resolving the backend is implemented in the BaseURLResolver
+		// interface (from middleware.BaseURLResolver), which is passed in as a parameter to
 		// MakeForwardingProxyHandler.
-		// This resolver typically uses information from the request (such as the function 
+		// This resolver typically uses information from the request (such as the function
 		// name in the path) to map to the correct backend service
 		baseURL := baseURLResolver.Resolve(r)
 		originalURL := r.URL.String()
 		// This function transforms the incoming request path to the path expected by the backend.
 		requestURL := urlPathTransformer.Transform(r)
-
 
 		// SA - Generate a unique request ID for tracing purposes
 		// This request ID is set in the "X-Request-ID" header of the request
@@ -83,7 +88,24 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 
 		seconds := time.Since(start)
 
-		// All notifiers are notified that the request has completed, 
+		// SA - mark the pod status as idle
+		if podStatusUpdater != nil {
+			parts := strings.Split(statusCode, "+")
+			podName := parts[2]
+			podIP := parts[1]
+			if podName != "" && podIP != "" {
+				go func() {
+					if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
+						log.Printf("error marking pod as idle: %s\n", err.Error())
+					}
+				}()
+
+			}
+			log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
+
+		}
+
+		// All notifiers are notified that the request has completed,
 		// along with the status code and duration
 		for _, notifier := range notifiers {
 			notifier.Notify(reqID, r.Method, requestURL, originalURL, statusCode, "completed", seconds)
@@ -94,11 +116,10 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 // SA - randomID generates a random ID for tracing purposes
 // This function generates a random 16-byte ID and returns it as a hexadecimal string.
 func randomID() string {
-    b := make([]byte, 16)
-    rand.Read(b)
-    return fmt.Sprintf("%x", b)
+	b := make([]byte, 16)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }
-
 
 func buildUpstreamRequest(r *http.Request, baseURL string, requestURL string) *http.Request {
 	url := baseURL + requestURL
@@ -141,7 +162,7 @@ func forwardRequest(w http.ResponseWriter,
 	if r.Body != nil {
 		defer r.Body.Close()
 	}
-	// The backend is specified by the combination of baseURL (from the resolver) 
+	// The backend is specified by the combination of baseURL (from the resolver)
 	// and requestURL (from the transformer) and then the actual request is built
 	// using the buildUpstreamRequest function. This function creates a new HTTP request
 	// with the method, URL, and headers from the original request, but modifies the URL
@@ -190,12 +211,14 @@ func forwardRequest(w http.ResponseWriter,
 		io.Copy(w, res.Body)
 	}
 
-	// SA - return the "res.StatusCode + X-OpenFaaS-Backend-IP" to indicate the status 
+	// SA - return the "res.StatusCode + X-OpenFaaS-Backend-IP" to indicate the status
 	// and the Pod IP of the request
 	code := strconv.Itoa(res.StatusCode)
 	// SA - Get the service IP from the response header
 	serviceIP := res.Header.Get("X-OpenFaaS-Backend-IP")
-	statusCode := code + "+" + serviceIP
+	// podIP := res.Header.Get("X-OpenFaaS-Pod-IP")
+	podName := res.Header.Get("X-OpenFaaS-Pod-Name")
+	statusCode := code + "+" + serviceIP + "+" + podName
 
 	return statusCode, nil
 }
