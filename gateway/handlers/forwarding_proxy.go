@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"os"
 	"strings"
@@ -81,18 +82,94 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 
 		start := time.Now()
 
-		statusCode, err := forwardRequest(w, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
-		if err != nil {
-			log.Printf("error with upstream request to: %s, %s\n", requestURL, err.Error())
+		// ---------------------------Replacing with Exponentially Backoff---------------------------
+		// SA - To ensure that non-200 status codes are retried once,
+		// we will retry the request once if the status code is not 200.
+		// The first request is sent to the backend service using the forwardRequest function.
+		// This also ensures that non-200 status code is not sent to the client
+		// and the client only receives a 200 status code if the request is successful.
+		// rec := httptest.NewRecorder()
+
+		// // This also ensures that non-200 status code is not sent to the client
+		// // and the client only receives a 200 status code if the request is successful.
+		// statusCode, err := forwardRequest(rec, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
+		// if err != nil {
+		// 	log.Printf("error with upstream request to: %s, %s\n", requestURL, err.Error())
+		// }
+
+		// // SA - If the status code is not 200, retry once more
+		// statusCodeCheck, _, _ := splitStatusCode(statusCode)
+		// if statusCodeCheck != strconv.Itoa(http.StatusOK) {
+		// 	log.Printf("Retrying request to %s with status code %s\n", requestURL, statusCodeCheck)
+		// 	// Use a ResponseRecorder for the retry
+		// 	recRetry := httptest.NewRecorder()
+		// 	// Retry the request once more
+		// 	statusCode, err = forwardRequest(recRetry, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
+		// 	if err != nil {
+		// 		log.Printf("error with upstream request to: %s, %s\n", requestURL, err.Error())
+		// 		// If the retry fails, set the status code to 502 Bad Gateway
+		// 		// statusCode = strconv.Itoa(http.StatusBadGateway) + "+" + baseURL + "+" + "retry_failed"
+		// 	} else {
+		// 		for k, v := range recRetry.Header() {
+		// 			w.Header()[k] = v
+		// 		}
+		// 		w.WriteHeader(recRetry.Code)
+		// 		recRetry.Body.WriteTo(w)
+		// 		log.Printf("Retry successful for request to %s with status code %s\n", requestURL, statusCode)
+		// 	}
+		// } else {
+		// 	// If the status code is 200, write the response to the client
+		// 	for k, v := range rec.Header() {
+		// 		w.Header()[k] = v
+		// 	}
+		// 	w.WriteHeader(rec.Code)
+		// 	rec.Body.WriteTo(w)
+		// }
+		// ---------------------------Replacing with Exponentially Backoff---------------------------
+
+		// SA - Exponential backoff retry logic
+		// ...existing code...
+		maxRetries := 3
+		baseDelay := 200 * time.Millisecond
+
+		var (
+			rec         *httptest.ResponseRecorder
+			statusCode  string
+			statusCheck string
+			err         error
+		)
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			rec = httptest.NewRecorder()
+			statusCode, err = forwardRequest(rec, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
+			statusCheck, _, _ = splitStatusCode(statusCode)
+			if statusCheck == strconv.Itoa(http.StatusOK) {
+				break
+			}
+			if attempt < maxRetries {
+				backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
+				log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
+				time.Sleep(backoff)
+			}
+		}
+
+		for k, v := range rec.Header() {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		rec.Body.WriteTo(w)
+
+		if statusCheck == strconv.Itoa(http.StatusOK) {
+			log.Printf("Request to %s succeeded with status %s within %d attempt(s)", requestURL, statusCheck, maxRetries)
+		} else {
+			log.Printf("Request to %s failed after %d attempts, last status %s, error %s", requestURL, maxRetries, statusCheck, err)
 		}
 
 		seconds := time.Since(start)
 
 		// SA - mark the pod status as idle
 		if podStatusUpdater != nil {
-			parts := strings.Split(statusCode, "+")
-			podName := parts[2]
-			podIP := parts[1]
+			_, podIP, podName := splitStatusCode(statusCode)
 			if podName != "" && podIP != "" {
 				go func() {
 					if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
@@ -111,6 +188,14 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 			notifier.Notify(reqID, r.Method, requestURL, originalURL, statusCode, "completed", seconds)
 		}
 	}
+}
+
+func splitStatusCode(statusCode string) (string, string, string) {
+	parts := strings.Split(statusCode, "+")
+	if len(parts) < 3 {
+		return statusCode, "", ""
+	}
+	return parts[0], parts[1], parts[2]
 }
 
 // SA - randomID generates a random ID for tracing purposes
