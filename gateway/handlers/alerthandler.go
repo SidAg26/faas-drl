@@ -119,3 +119,63 @@ func CalculateReplicas(status string, currentReplicas uint64, maxReplicas uint64
 
 	return newReplicas
 }
+
+// SA - Updated scaleService function to handle custom scaling logic
+// Modify the scaleService function in alerthandler.go
+// 	"strconv"  // Add this import
+
+// func scaleService(alert requests.PrometheusInnerAlert, service scaling.ServiceQuery, defaultNamespace string) error {
+// 	var err error
+
+// 	serviceName, namespace := middleware.GetNamespace(defaultNamespace, alert.Labels.FunctionName)
+
+// 	if len(serviceName) > 0 {
+// 		queryResponse, getErr := service.GetReplicas(serviceName, namespace)
+// 		if getErr == nil {
+// 			status := alert.Status
+
+// 			// Check if the alert has a specific replica count specified
+// 			var newReplicas uint64
+// 			if replicaStr, exists := alert.Labels["replicas"]; exists {
+// 				// Parse the replica count from the label
+// 				if parsedReplicas, parseErr := strconv.ParseUint(replicaStr, 10, 64); parseErr == nil {
+// 					newReplicas = parsedReplicas
+// 					log.Printf("[Scale] function=%s %d => %d (using specified replicas).\n",
+// 						serviceName, queryResponse.Replicas, newReplicas)
+// 				} else {
+// 					// Fall back to calculated replicas if parsing fails
+// 					newReplicas = CalculateReplicas(status, queryResponse.Replicas, uint64(queryResponse.MaxReplicas),
+// 						queryResponse.MinReplicas, queryResponse.ScalingFactor)
+// 					log.Printf("[Scale] function=%s %d => %d (calculated, parse error: %s).\n",
+// 						serviceName, queryResponse.Replicas, newReplicas, parseErr)
+// 				}
+// 			} else {
+// 				// Use the standard calculation if no replica count is specified
+// 				newReplicas = CalculateReplicas(status, queryResponse.Replicas, uint64(queryResponse.MaxReplicas),
+// 					queryResponse.MinReplicas, queryResponse.ScalingFactor)
+// 				log.Printf("[Scale] function=%s %d => %d (calculated).\n",
+// 					serviceName, queryResponse.Replicas, newReplicas)
+// 			}
+
+// 			// Ensure we don't exceed max replicas
+// 			if newReplicas > uint64(queryResponse.MaxReplicas) {
+// 				newReplicas = uint64(queryResponse.MaxReplicas)
+// 			}
+
+// 			// Ensure we don't go below min replicas
+// 			if newReplicas < queryResponse.MinReplicas {
+// 				newReplicas = queryResponse.MinReplicas
+// 			}
+
+// 			if newReplicas == queryResponse.Replicas {
+// 				return nil
+// 			}
+
+// 			updateErr := service.SetReplicas(serviceName, namespace, newReplicas)
+// 			if updateErr != nil {
+// 				err = updateErr
+// 			}
+// 		}
+// 	}
+// 	return err
+// }
