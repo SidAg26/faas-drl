@@ -3,6 +3,44 @@
 
 // Copyright (c) Alex Ellis 2017. All rights reserved.
 
+// README: Alert Handler for OpenFaaS Gateway
+//
+// This file implements the handler for Prometheus Alertmanager webhooks and synthetic alerts for scaling OpenFaaS functions.
+// To use or modify this component, follow these instructions:
+//
+// 1. Integration:
+//    - Register the handler in your main.go with:
+//        r.HandleFunc("/system/alert", handlers.MakeAlertHandler(...)).Methods(http.MethodPost)
+//
+// 2. Alert Format:
+//    - The handler expects a JSON body matching the requests.PrometheusAlert struct.
+//    - Alerts should include at least "alertname" and "function_name" in the labels.
+//    - To trigger a specific replica count, set the "desired_replicas" field in the alert labels (as *int32).
+//
+// 3. Authentication:
+//    - If your gateway is protected by Basic Auth, ensure that POST requests to /system/alert include the correct credentials.
+//    - For synthetic alerts (e.g., from error_based_scaling.go), set credentials using req.SetBasicAuth("admin", "yourpassword").
+//
+// 4. Scaling Logic:
+//    - If "desired_replicas" is set in the alert, the handler will scale the function to that count.
+//    - If not set, the handler uses CalculateReplicas() to determine the new replica count based on alert status and scaling factors.
+//
+// 5. Error Handling:
+//    - All errors in alert parsing or scaling are logged and returned as HTTP 400 or 500 responses.
+//
+// 6. Customization:
+//    - You can extend the alert labels or annotations as needed for your use case.
+//    - To support more flexible label handling, consider using map[string]string for labels in the alert struct.
+//
+// CHANGES MADE BY SA:
+// - Added support for "desired_replicas" field in PrometheusInnerAlertLabel to allow custom scaling via alerts.
+// - Updated scaleService to use the desired replica count from the alert if provided.
+// - Updated README instructions to reflect the new custom scaling capability.
+//
+// Place these instructions at the top of this file for quick reference and onboarding.
+//
+// --- End README ---
+
 package handlers
 
 import (
@@ -83,12 +121,21 @@ func scaleService(alert requests.PrometheusInnerAlert, service scaling.ServiceQu
 		queryResponse, getErr := service.GetReplicas(serviceName, namespace)
 		if getErr == nil {
 			status := alert.Status
+			// SA - Check if the alert has a specific replica count specified
+			var newReplicas uint64
+			if alert.Labels.DesiredReplicas != nil {
+				// SA - Use the desired replicas from the alert
+				newReplicas = uint64(*alert.Labels.DesiredReplicas)
+				log.Printf("[ScaleCustom] function=%s %d => %d (using desired replicas).\n",
+					serviceName, queryResponse.Replicas, newReplicas)
+			} else {
+				// Use the standard calculation if no desired replicas are specified
+				newReplicas = CalculateReplicas(status, queryResponse.Replicas, uint64(queryResponse.MaxReplicas), queryResponse.MinReplicas, queryResponse.ScalingFactor)
 
-			newReplicas := CalculateReplicas(status, queryResponse.Replicas, uint64(queryResponse.MaxReplicas), queryResponse.MinReplicas, queryResponse.ScalingFactor)
-
-			log.Printf("[Scale] function=%s %d => %d.\n", serviceName, queryResponse.Replicas, newReplicas)
-			if newReplicas == queryResponse.Replicas {
-				return nil
+				log.Printf("[Scale] function=%s %d => %d.\n", serviceName, queryResponse.Replicas, newReplicas)
+				if newReplicas == queryResponse.Replicas {
+					return nil
+				}
 			}
 
 			updateErr := service.SetReplicas(serviceName, namespace, newReplicas)
