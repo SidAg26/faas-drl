@@ -66,6 +66,8 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		originalURL := r.URL.String()
 		// This function transforms the incoming request path to the path expected by the backend.
 		requestURL := urlPathTransformer.Transform(r)
+		// SA - set a flag to indicate if this request is a function request
+		isFunctionRequest := strings.HasPrefix(requestURL, "/function/")
 
 		// SA - Generate a unique request ID for tracing purposes
 		// This request ID is set in the "X-Request-ID" header of the request
@@ -128,7 +130,11 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		// ---------------------------Replacing with Exponentially Backoff---------------------------
 
 		// SA - Exponential backoff retry logic
-		// ...existing code...
+		// This retry logic is ONLY applied to function requests
+		// else an error is returned immediately for "/system/functions" routes
+		// If the request is not a function request, it will be sent once without retrying.
+		// The retry logic will retry the request up to 3 times with an exponential backoff
+		// The backoff will start at 200ms and double each time, up to a maximum of 3 retries.
 		maxRetries := 3
 		baseDelay := 200 * time.Millisecond
 
@@ -139,48 +145,56 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 			err         error
 		)
 
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			rec = httptest.NewRecorder()
-			statusCode, err = forwardRequest(rec, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
-			statusCheck, _, _ = splitStatusCode(statusCode)
+		if isFunctionRequest {
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				rec = httptest.NewRecorder()
+				statusCode, err = forwardRequest(rec, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
+				statusCheck, _, _ = splitStatusCode(statusCode)
+				if statusCheck == strconv.Itoa(http.StatusOK) || statusCheck == strconv.Itoa((http.StatusAccepted)) {
+					break
+				}
+				if attempt < maxRetries {
+					backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
+					log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
+					time.Sleep(backoff)
+				}
+			}
+
+			for k, v := range rec.Header() {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(rec.Code)
+			rec.Body.WriteTo(w)
+
 			if statusCheck == strconv.Itoa(http.StatusOK) {
-				break
+				log.Printf("Request to %s succeeded with status %s within %d attempt(s)", requestURL, statusCheck, maxRetries)
+			} else {
+				log.Printf("Request to %s failed after %d attempts, last status %s, error %s", requestURL, maxRetries, statusCheck, err)
 			}
-			if attempt < maxRetries {
-				backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
-				log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
-				time.Sleep(backoff)
+
+			// SA - mark the pod status as idle
+			if podStatusUpdater != nil {
+				_, podIP, podName := splitStatusCode(statusCode)
+				if podName != "" && podIP != "" {
+					go func() {
+						if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
+							log.Printf("error marking pod as idle: %s\n", err.Error())
+						}
+					}()
+					log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
+				}
+
 			}
-		}
-
-		for k, v := range rec.Header() {
-			w.Header()[k] = v
-		}
-		w.WriteHeader(rec.Code)
-		rec.Body.WriteTo(w)
-
-		if statusCheck == strconv.Itoa(http.StatusOK) {
-			log.Printf("Request to %s succeeded with status %s within %d attempt(s)", requestURL, statusCheck, maxRetries)
 		} else {
-			log.Printf("Request to %s failed after %d attempts, last status %s, error %s", requestURL, maxRetries, statusCheck, err)
+			// For non-function requests, we send the request once without retrying
+			statusCode, err = forwardRequest(w, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
+			if err != nil {
+				log.Printf("error with upstream request to: %s, %s\n", requestURL, err.Error())
+			}
+
 		}
 
 		seconds := time.Since(start)
-
-		// SA - mark the pod status as idle
-		if podStatusUpdater != nil {
-			_, podIP, podName := splitStatusCode(statusCode)
-			if podName != "" && podIP != "" {
-				go func() {
-					if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
-						log.Printf("error marking pod as idle: %s\n", err.Error())
-					}
-				}()
-
-			}
-			log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
-
-		}
 
 		// All notifiers are notified that the request has completed,
 		// along with the status code and duration
