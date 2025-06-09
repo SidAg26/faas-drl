@@ -25,7 +25,23 @@ func MakeScalingHandler(next http.HandlerFunc, scaler scaling.FunctionScaler, co
 
 		functionName, namespace := middleware.GetNamespace(defaultNamespace, middleware.GetServiceName(r.URL.String()))
 
+		// SA - This scaler wraps the function proxy request and checks whether exists or not
+		// before allowing the request to proceed. If the function is not found
+		// or if it is not available, then we return an error to the client. If found, then
+		// it checks and ensures that the function has minimumReplicas available
+		// before allowing the request to proceed.
+		// SA - This is where the logic for "Version Checking" needs to be added
 		res := scaler.Scale(functionName, namespace)
+
+		// SA - If any function version is matched, then we update the URL path
+		// to point to the matched function version. This is useful for
+		// routing requests to the correct function version.
+		if res.Available && res.ServiceNameMatched != nil {
+			log.Printf("[ScaleCustom] function=%s.%s available after %.4fs for the cuurent function=%s\n",
+				*res.ServiceNameMatched, namespace, res.Duration.Seconds(), functionName)
+			r.URL.Path = fmt.Sprintf("/function/%s.%s", *res.ServiceNameMatched, namespace)
+			r.URL.RawPath = fmt.Sprintf("/function/%s.%s", *res.ServiceNameMatched, namespace)
+		}
 
 		if !res.Found {
 			errStr := fmt.Sprintf("error finding function %s.%s: %s", functionName, namespace, res.Error.Error())
@@ -46,6 +62,11 @@ func MakeScalingHandler(next http.HandlerFunc, scaler scaling.FunctionScaler, co
 		}
 
 		if res.Available {
+			if res.ServiceNameMatched != nil {
+				r.URL.Path = fmt.Sprintf("/function/%s.%s", *res.ServiceNameMatched, namespace)
+				r.URL.RawPath = fmt.Sprintf("/function/%s.%s", *res.ServiceNameMatched, namespace)
+			}
+			// log.Printf("[ScaleCustom] function request=%s", r)
 			next.ServeHTTP(w, r)
 			return
 		}
