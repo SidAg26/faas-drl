@@ -32,6 +32,10 @@ type FunctionScaleResult struct {
 	Error     error
 	Found     bool
 	Duration  time.Duration
+	// SA - Add the Optional field for the matched function version
+	// This is used to indicate if the function version was matched
+	// with any other version of the function
+	ServiceNameMatched *string
 }
 
 // Scale scales a function from zero replicas to 1 or the value set in
@@ -43,6 +47,19 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 	// request can be served.
 	if cachedResponse, hit := f.Cache.Get(functionName, namespace); hit &&
 		cachedResponse.AvailableReplicas > 0 {
+		// SA - Check if the cached response has the "version_checked" annotation
+		// If the annotation is present, then the function was matched with
+		// any other version of the function
+		if cachedResponse.Annotations != nil && (*cachedResponse.Annotations)["version_checked"] == "true" {
+			versionFound := (*cachedResponse.Annotations)["version_found"]
+			return FunctionScaleResult{
+				Error:              nil,
+				Available:          true,
+				Found:              true,
+				Duration:           time.Since(start),
+				ServiceNameMatched: &versionFound,
+			}
+		}
 		return FunctionScaleResult{
 			Error:     nil,
 			Available: true,
@@ -55,6 +72,13 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 	// so query the live endpoint
 	getKey := fmt.Sprintf("GetReplicas-%s.%s", functionName, namespace)
 	res, err, _ := f.SingleFlight.Do(getKey, func() (interface{}, error) {
+		// SA - This is where the logic for "Version Checking" needs to be added inside
+		// the GetReplicas function.
+		// This is the "First Layer" of Version Checking
+		// if the function request for "functionName" (here referred to as serviceName) is not found
+		// then we check for other available versions in the format "functionName-{memory}-{CPU}"
+		// If the function is not found, then we return an error
+		// If the function is found, then we return the replicas and available replicas
 		return f.Config.ServiceQuery.GetReplicas(functionName, namespace)
 	})
 
@@ -77,6 +101,22 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 
 	// Check if there are available replicas in the live data
 	if res.(ServiceQueryResponse).AvailableReplicas > 0 {
+		// SA - Before the scale up logic is executed we need to check if the
+		// function was matched with any other version of the function.
+		// If the function was matched with any other version of the function
+		// then we need to return the matched function version.
+		queryResponse := res.(ServiceQueryResponse)
+		if queryResponse.Annotations != nil && (*queryResponse.Annotations)["version_checked"] == "true" {
+			versionFound := (*queryResponse.Annotations)["version_found"]
+			return FunctionScaleResult{
+				Error:              nil,
+				Available:          true,
+				Found:              true,
+				Duration:           time.Since(start),
+				ServiceNameMatched: &versionFound,
+			}
+
+		}
 		return FunctionScaleResult{
 			Error:     nil,
 			Available: true,
