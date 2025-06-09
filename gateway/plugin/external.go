@@ -4,7 +4,8 @@
 // Copyright (c) Alex Ellis 2017. All rights reserved.
 
 package plugin
-// SA - This package is used as an interface for the gateway 
+
+// SA - This package is used as an interface for the gateway
 // to query external providers like faas-netes in our case for
 // scaling and querying function metadata. It uses HTTP to communicate
 // with the external service and handles authentication if needed.
@@ -19,7 +20,11 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
+
+	// SA - for the regexp package
+	"regexp"
 
 	types "github.com/openfaas/faas-provider/types"
 	middleware "github.com/openfaas/faas/gateway/pkg/middleware"
@@ -108,7 +113,54 @@ func (s ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string) 
 		// log.Printf("GetReplicas [%s.%s] took: %fs", serviceName, serviceNamespace, time.Since(start).Seconds())
 
 	} else {
-		log.Printf("GetReplicas [%s.%s] took: %.4fs, code: %d\n", serviceName, serviceNamespace, time.Since(start).Seconds(), res.StatusCode)
+		// SA - This is where the logic for "Version Checking" needs to be added
+		// if the function request for "functionName" (here referred to as serviceName) is not found
+		// then we check for other available versions in the format "functionName-{memory}-{CPU}"
+		// and return the first available version if found.
+
+		// Try to find other available versions
+		listURL := fmt.Sprintf("%ssystem/functions?namespace=%s", s.URL.String(), serviceNamespace)
+		listReq, err := http.NewRequest(http.MethodGet, listURL, nil)
+		if err != nil {
+			return emptyServiceQueryResponse, err
+		}
+		if s.AuthInjector != nil {
+			s.AuthInjector.Inject(listReq)
+		}
+		listRes, err := s.ProxyClient.Do(listReq)
+		if err != nil {
+			log.Println(listURL, err)
+			return emptyServiceQueryResponse, err
+		}
+		defer listRes.Body.Close()
+
+		log.Printf("[GetReplicasCustom] Checking for available versions of function: %s in namespace: %s", serviceName, serviceNamespace)
+		if listRes.StatusCode == http.StatusOK {
+			var functions []types.FunctionStatus
+			listBytes, _ := io.ReadAll(listRes.Body)
+			if err := json.Unmarshal(listBytes, &functions); err != nil {
+				log.Printf("Unable to unmarshal function list: %q, %s", string(listBytes), err)
+				return emptyServiceQueryResponse, err
+			}
+			// Look for a function with the same base name and a version suffix
+			// Extract the base service name from the function name
+			baseName := serviceName
+			if idx := strings.Index(serviceName, "-"); idx != -1 {
+				baseName = serviceName[:idx]
+			}
+			log.Printf("Base service name: %s", baseName)
+
+			alternativeFunction, err := FindAlternativeFunctionVersion(serviceName, baseName, functions)
+			if err != nil {
+				return emptyServiceQueryResponse, fmt.Errorf("error finding alternative function version: %w", err)
+			}
+			if alternativeFunction != nil {
+				log.Printf("Found alternative function version: %s with available replicas: %d", serviceName, alternativeFunction.AvailableReplicas)
+				return *alternativeFunction, nil
+			}
+		}
+
+		log.Printf("[GetReplicasCustom] [%s.%s] took: %.4fs, code: %d\n", serviceName, serviceNamespace, time.Since(start).Seconds(), res.StatusCode)
 		return emptyServiceQueryResponse, fmt.Errorf("server returned non-200 status code (%d) for function, %s, body: %s", res.StatusCode, serviceName, string(bytesOut))
 	}
 
@@ -199,4 +251,56 @@ func extractLabelValue(rawLabelValue string, fallback uint64) uint64 {
 	}
 
 	return uint64(value)
+}
+
+// SA - FindAlternativeFunctionVersion searches for an alternative function version with available replicas.
+func FindAlternativeFunctionVersion(serviceName, baseName string, functions []types.FunctionStatus) (*scaling.ServiceQueryResponse, error) {
+	pattern := fmt.Sprintf(`^%s-\d+-\d+$`, regexp.QuoteMeta(baseName))
+	re := regexp.MustCompile(pattern)
+
+	for _, fn := range functions {
+		if fn.Name == serviceName {
+			continue // skip the original function
+		}
+		if re.MatchString(fn.Name) && fn.AvailableReplicas > 0 {
+			minReplicas := uint64(scaling.DefaultMinReplicas)
+			maxReplicas := uint64(scaling.DefaultMaxReplicas)
+			scalingFactor := uint64(scaling.DefaultScalingFactor)
+			availableReplicas := fn.AvailableReplicas
+
+			if fn.Labels != nil {
+				labels := *fn.Labels
+				minReplicas = extractLabelValue(labels[scaling.MinScaleLabel], minReplicas)
+				maxReplicas = extractLabelValue(labels[scaling.MaxScaleLabel], maxReplicas)
+				extractedScalingFactor := extractLabelValue(labels[scaling.ScalingFactorLabel], scalingFactor)
+				if extractedScalingFactor > 0 && extractedScalingFactor <= 100 {
+					scalingFactor = extractedScalingFactor
+				} else {
+					return nil, fmt.Errorf("bad scaling factor: %d, is not in range of [0 - 100]", extractedScalingFactor)
+				}
+			}
+
+			if fn.Annotations == nil {
+				fn.Annotations = &map[string]string{}
+			}
+			annotations := fn.Annotations
+			if annotations == nil {
+				m := make(map[string]string)
+				annotations = &m
+			}
+			(*annotations)["version_found"] = fn.Name
+			(*annotations)["version_checked"] = "true"
+
+			resp := scaling.ServiceQueryResponse{
+				Replicas:          fn.Replicas,
+				MaxReplicas:       maxReplicas,
+				MinReplicas:       minReplicas,
+				ScalingFactor:     scalingFactor,
+				AvailableReplicas: availableReplicas,
+				Annotations:       annotations,
+			}
+			return &resp, nil
+		}
+	}
+	return nil, nil
 }
