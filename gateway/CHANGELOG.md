@@ -68,9 +68,26 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
 
 ### faas-provider-openfaas
 
+- **Custom logic in proxy/proxy.go**:
+  - Added/modified headers to track backend pod/service IPs (`X-OpenFaaS-Backend-IP`).
+  - Improved request/response tracing for debugging and observability.
+
 - **Pod Status Cache & Pod Status Marking**
-  - Updated the `types` compatible with the PodStatusCahcing and PodStatusUpdater interface and methods
+  - Updated the `types` compatible with the PodStatusCahcing and PodStatusUpdater interface and methods.
+  - Added a `PodStatusCache` type to track pod status (busy/idle).
+  - Implemented methods for querying/updating pod statuses.
   - (If used as a base for the provider) Ensured the `serve.go` and router setup allow for custom handler registration, including `/system/podstatus/{status}`.
+  - Registered a new HTTP handler for `/system/podstatus/{status}` in the provider's router (see `main.go`), using `handlers.MakePodIdleHandler`.
+  - Ensured the provider exposes this endpoint so the gateway can mark pods as busy or idle.
+
+- **Custom Deployment & Pod Version Checking**:
+  - Implemented logic in `plugin/external.go` and `scaling/function_scaler.go` to support dynamic function versioning and custom deployments:
+    - If a requested function version (e.g., `func-256-1`) is not found, the gateway will:
+      - Search for alternative versions with available replicas (e.g., `func-128-1`, `func-512-2`).
+      - If no suitable version is found, it will attempt to deploy a new function with the requested resources (memory/CPU) by cloning the base function definition and adjusting resource limits.
+      - The deployment is initiated via the provider's `/system/functions` endpoint.
+      - The scaling logic and cache are aware of version matches and annotate responses to indicate if a version was matched or a deployment was triggered.
+    - This enables on-demand, resource-specific function deployments and fallback to available versions, improving flexibility and resource utilization.
 
 ---
 
@@ -140,6 +157,9 @@ For the Pod Status Caching and Pod Status Marking:
 - **Request routing strategies**:  
   The codebase is now structured to allow easy addition of new routing strategies (e.g., least connections, weighted, etc.) in the future.
 
+- **Custom deployment/version fallback**:  
+  If a function version is not found, the gateway will attempt to find an alternative version or deploy a new one with the requested resources.
+
 ---
 
 ## 5. Purpose of Changes
@@ -158,6 +178,9 @@ For the Pod Status Caching and Pod Status Marking:
 
 - **Pod Status Cache and Pod Status Marking**
   These changes enable the OpenFaaS gateway to track and update the status of function pods (busy/idle) in real time, improving scheduling, observability, and future scaling strategies.
+
+- **Custom deployment and version checking**:  
+  The gateway and provider now support dynamic function versioning, fallback to available versions, and on-demand deployment of new function variants with specific resource requirements.
 
 ---
 
