@@ -149,11 +149,45 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 			for attempt := 1; attempt <= maxRetries; attempt++ {
 				rec = httptest.NewRecorder()
 				statusCode, err = forwardRequest(rec, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector, reverseProxy)
+				if err != nil {
+					log.Printf("error with upstream request to: %s, %s\n", requestURL, err.Error())
+					// SA - If the error is not nil, we log it and continue to retry
+					// We mark the pod as idle here to ensure that the pod is not marked as busy
+					// even if the request fails
+					if podStatusUpdater != nil {
+						_, podIP, podName := splitStatusCode(statusCode)
+						if podName != "" && podIP != "" {
+							go func() {
+								if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
+									log.Printf("error marking pod as idle: %s\n", err.Error())
+								}
+							}()
+							log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
+						}
+					}
+					backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
+					log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
+					time.Sleep(backoff)
+					continue
+				}
 				statusCheck, _, _ = splitStatusCode(statusCode)
 				if statusCheck == strconv.Itoa(http.StatusOK) || statusCheck == strconv.Itoa((http.StatusAccepted)) {
 					break
 				}
 				if attempt < maxRetries {
+					// SA - mark the pod status as idle
+					if podStatusUpdater != nil {
+						_, podIP, podName := splitStatusCode(statusCode)
+						if podName != "" && podIP != "" {
+							go func() {
+								if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
+									log.Printf("error marking pod as idle: %s\n", err.Error())
+								}
+							}()
+							log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
+						}
+
+					}
 					backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
 					log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
 					time.Sleep(backoff)
