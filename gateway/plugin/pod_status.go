@@ -40,7 +40,7 @@ func (p *PodStatusPlugin) sendStatusUpdate(status, podName, podIP string) error 
 		"podName": podName,
 		"podIP":   podIP,
 	})
-	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(body))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(body)) // SA - use http.MethodPost
 	if err != nil {
 		return err
 	}
@@ -59,23 +59,40 @@ func (p *PodStatusPlugin) sendStatusUpdate(status, podName, podIP string) error 
 	return nil
 }
 
-func (p *PodStatusPlugin) GetPodStatus(podName, podIP string) (providertypes.PodStatus, bool) {
-	endpoint := fmt.Sprintf("%s/system/podstatus/query?podName=%s&podIP=%s", p.providerURL.String(), podName, podIP)
-	req, err := http.NewRequest("GET", endpoint, nil)
+func (p *PodStatusPlugin) GetPodStatus(functionName, namespace string) ([]providertypes.PodStatus, error) {
+	u := *p.providerURL // copy
+	u.Path = path.Join(u.Path, "system/podstatus/query")
+
+	// endpoint := fmt.Sprintf("%s/system/podstatus/query?podName=%s&podIP=%s", p.providerURL.String(), podName, podIP)
+	// Use query parameters for GET request
+	q := u.Query()
+	q.Set("functionName", functionName)
+	q.Set("namespace", namespace)
+	u.RawQuery = q.Encode()
+
+	endpoint := u.String()
+
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return providertypes.PodStatus{}, false
+		return nil, err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	if p.auth != nil {
 		p.auth.Inject(req)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return providertypes.PodStatus{}, false
+		return nil, err
 	}
 	defer resp.Body.Close()
-	var status providertypes.PodStatus
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return providertypes.PodStatus{}, false
+
+	if resp.StatusCode != http.StatusOK {
+		// If the status code is not OK, we return an empty slice and false
+		return nil, fmt.Errorf("failed to fetch pod status: %s", resp.Status)
 	}
-	return status, true
+	var statuses []providertypes.PodStatus
+	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %v", err)
+	}
+	return statuses, nil
 }
