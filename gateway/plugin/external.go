@@ -109,6 +109,41 @@ func (s ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string) 
 			log.Printf("Unable to unmarshal: %q, %s", string(bytesOut), err)
 			return emptyServiceQueryResponse, err
 		}
+		// -----------------------------------------------
+		//SA - TESTING THE POD STATUS FETCHING
+
+		urlPath = fmt.Sprintf("%ssystem/podstatus/query?functionName=%s&namespace=%s",
+			s.URL.String(),
+			serviceName,
+			serviceNamespace)
+
+		req, err = http.NewRequest(http.MethodGet, urlPath, nil)
+		if err != nil {
+			return emptyServiceQueryResponse, err
+		}
+		if s.AuthInjector != nil {
+			s.AuthInjector.Inject(req)
+		}
+		res, err = s.ProxyClient.Do(req)
+		if err != nil {
+			log.Println(urlPath, err)
+			return emptyServiceQueryResponse, err
+		}
+		if res.Body != nil {
+			bytesOut, _ = io.ReadAll(res.Body)
+			defer res.Body.Close()
+		}
+		if res.StatusCode == http.StatusOK {
+			var podStatuses []types.PodStatus
+			if err := json.Unmarshal(bytesOut, &podStatuses); err != nil {
+				log.Printf("Unable to unmarshal: %q, %s", string(bytesOut), err)
+				return emptyServiceQueryResponse, err
+			}
+			// Log the pod statuses for debugging
+			log.Printf("Pod statuses for function %s in namespace %s: %+v", serviceName, serviceNamespace, podStatuses)
+		}
+		//SA - TESTING THE POD STATUS FETCHING
+		// ---------------------------------------------------
 
 		// log.Printf("GetReplicas [%s.%s] took: %fs", serviceName, serviceNamespace, time.Since(start).Seconds())
 
