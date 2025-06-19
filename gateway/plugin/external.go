@@ -16,15 +16,19 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand" // SA - Importing math/rand to use random number generation
 	"net"
 	"net/http"
 	"net/url"
+	"sort" // SA - sort package is used to sort the alternative function versions
 	"strconv"
 	"strings"
 	"time"
 
 	// SA - for the regexp package
 	"regexp"
+
+	"golang.org/x/sync/singleflight" // SA - Importing singleflight for handling concurrent requests
 
 	types "github.com/openfaas/faas-provider/types"
 	middleware "github.com/openfaas/faas/gateway/pkg/middleware"
@@ -39,6 +43,8 @@ type ExternalServiceQuery struct {
 
 	// IncludeUsage includes usage metrics in the response
 	IncludeUsage bool
+	// SA - Add the deployGroup field to handle singleflight for deployments
+	deployGroup singleflight.Group
 }
 
 // NewExternalServiceQuery proxies service queries to external plugin via HTTP
@@ -59,22 +65,24 @@ func NewExternalServiceQuery(externalURL url.URL, authInjector middleware.AuthIn
 		},
 	}
 
-	return ExternalServiceQuery{
+	return &ExternalServiceQuery{
 		URL:          externalURL,
 		ProxyClient:  proxyClient,
 		AuthInjector: authInjector,
 		IncludeUsage: false,
+		deployGroup:  singleflight.Group{},
 	}
 }
 
 // GetReplicas replica count for function
-func (s ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string) (scaling.ServiceQueryResponse, error) {
+func (s *ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string) (scaling.ServiceQueryResponse, error) {
 	start := time.Now()
 
 	var err error
 	var emptyServiceQueryResponse scaling.ServiceQueryResponse
 
 	function := types.FunctionStatus{}
+	var functions []types.FunctionStatus
 
 	urlPath := fmt.Sprintf("%ssystem/function/%s?namespace=%s&usage=%v",
 		s.URL.String(),
@@ -105,161 +113,117 @@ func (s ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string) 
 	}
 
 	if res.StatusCode == http.StatusOK {
+		// SA - Function exists in deployment, unmarshal the response
 		if err := json.Unmarshal(bytesOut, &function); err != nil {
-			log.Printf("Unable to unmarshal: %q, %s", string(bytesOut), err)
+			log.Printf("[GetReplicasCustom] Unable to unmarshal: %q, %s", string(bytesOut), err)
 			return emptyServiceQueryResponse, err
 		}
 		// -----------------------------------------------
-		//SA - TESTING THE POD STATUS FETCHING
-
-		urlPath = fmt.Sprintf("%ssystem/podstatus/query?functionName=%s&namespace=%s",
-			s.URL.String(),
-			serviceName,
-			serviceNamespace)
-
-		req, err = http.NewRequest(http.MethodGet, urlPath, nil)
+		//SA - 1. Check if the function has idle pods
+		// -----------------------------------------------
+		podFound, err := s.GetFunctionPodStatus(serviceName, serviceNamespace)
 		if err != nil {
+			log.Printf("[GetReplicasCustom] Error fetching pod statuses: %v", err)
 			return emptyServiceQueryResponse, err
 		}
-		if s.AuthInjector != nil {
-			s.AuthInjector.Inject(req)
-		}
-		res, err = s.ProxyClient.Do(req)
-		if err != nil {
-			log.Println(urlPath, err)
-			return emptyServiceQueryResponse, err
-		}
-		if res.Body != nil {
-			bytesOut, _ = io.ReadAll(res.Body)
-			defer res.Body.Close()
-		}
-		if res.StatusCode == http.StatusOK {
-			var podStatuses []types.PodStatus
-			if err := json.Unmarshal(bytesOut, &podStatuses); err != nil {
-				log.Printf("Unable to unmarshal: %q, %s", string(bytesOut), err)
+
+		// If idle pods are found, return the function status with
+		// default behavior
+		// If no idle pods are found, look for alternative solution
+		// -----------------------------------------------
+		// SA - 2. Check for alternative function versions - Resource Reused
+		// -----------------------------------------------
+		if !podFound {
+			// SA - No idle pods found, look for alternative solutions
+			// Score and Select the cheapest alternative solutions
+			log.Printf("[GetReplicasCustom] No idle pods found for function %s in namespace %s", serviceName, serviceNamespace)
+			functions, err = s.GetFunctionList(serviceNamespace)
+			if err != nil {
+				log.Printf("[GetReplicasCustom] Error fetching function list: %v", err)
 				return emptyServiceQueryResponse, err
 			}
-			// Log the pod statuses for debugging
-			log.Printf("Pod statuses for function %s in namespace %s: %+v", serviceName, serviceNamespace, podStatuses)
+
+			alternateVersionList, err := s.FindAlternativeFunctionVersion(serviceName, serviceNamespace, functions)
+			if err != nil {
+				log.Printf("[GetReplicasCustom] Error finding alternative function version: %v", err)
+				return emptyServiceQueryResponse, err
+			}
+			if alternateVersionList != nil {
+				return prepareVersionResponse(alternateVersionList[0])
+			}
+			// SA - No idle pods found and no alternative function version found
+			log.Printf("[GetReplicasCustom] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
 		}
-		//SA - TESTING THE POD STATUS FETCHING
-		// ---------------------------------------------------
-
-		// log.Printf("GetReplicas [%s.%s] took: %fs", serviceName, serviceNamespace, time.Since(start).Seconds())
-
+		// No idle pods found and no alternative function version found
+		// -----------------------------------------------
+		// SA - 3. If we are here, then try in a Best Effort manner and redirect to the original function
+		// -----------------------------------------------
+		log.Printf("GetReplicas [%s.%s] took: %fs", serviceName, serviceNamespace, time.Since(start).Seconds())
 	} else {
-		// // SA - This is where the logic for "Version Checking" needs to be added
-		// // if the function request for "functionName" (here referred to as serviceName) is not found
-		// // then we check for other available versions in the format "functionName-{memory}-{CPU}"
-		// // and return the first available version if found.
+		// SA - This is where the logic for "Version Checking" needs to be added
+		// if the function request for "functionName" (here referred to as serviceName) is not found
+		// then we check for other available versions in the format "functionName-{memory}-{CPU}"
+		// and return the first available version if found.
 
 		// Try to find other available versions (both for FindAlternativeFunctionVersion and DeployFunctionWithResources)
-		listURL := fmt.Sprintf("%ssystem/functions?namespace=%s", s.URL.String(), serviceNamespace)
-		listReq, err := http.NewRequest(http.MethodGet, listURL, nil)
+		log.Printf("[GetReplicasCustom] Function %s not found in namespace %s, status code: %d",
+			serviceName, serviceNamespace, res.StatusCode)
+		functions, err = s.GetFunctionList(serviceNamespace)
 		if err != nil {
+			log.Printf("[GetReplicasCustom] Error fetching function list: %v", err)
 			return emptyServiceQueryResponse, err
 		}
-		if s.AuthInjector != nil {
-			s.AuthInjector.Inject(listReq)
-		}
-		listRes, err := s.ProxyClient.Do(listReq)
-		if err != nil {
-			log.Println(listURL, err)
-			return emptyServiceQueryResponse, err
-		}
-		defer listRes.Body.Close()
 
-		var functions []types.FunctionStatus
-		log.Printf("[GetReplicasCustom] Checking for available versions of function: %s in namespace: %s", serviceName, serviceNamespace)
-		if listRes.StatusCode == http.StatusOK {
-			listBytes, _ := io.ReadAll(listRes.Body)
-			if err := json.Unmarshal(listBytes, &functions); err != nil {
-				log.Printf("Unable to unmarshal function list: %q, %s", string(listBytes), err)
+		// SA - 4. Find, Score and Select the cheapest alternative function versions
+		alternateVersionList, err := s.FindAlternativeFunctionVersion(serviceName, serviceNamespace, functions)
+		if err != nil {
+			log.Printf("[GetReplicasCustom] Error finding alternative function version: %v", err)
+			return emptyServiceQueryResponse, err
+		}
+		scoreVersion := uint64(0)
+		if alternateVersionList == nil {
+			log.Printf("[GetReplicasCustom] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
+			scoreVersion = uint64(0) // No alternative version found, set score to 0
+		} else {
+			scoreVersion = alternateVersionList[0].Score
+		}
+
+		// SA - 5. Score the deployment scheme (cold start)
+		// For now, we will use a simple scoring mechanism based on the version score
+		lower := uint64(float64(scoreVersion) * 0.8)
+		upper := max(uint64(float64(scoreVersion)*1.2), lower)
+		scoreColdStart := lower
+		if upper > lower {
+			scoreColdStart = lower + uint64(rand.Int63n(int64(upper-lower+1)))
+		}
+
+		// SA - 6. If the cold start is better, then deploy a new function with requested resources
+		if scoreColdStart < scoreVersion || scoreVersion == 0 {
+			log.Printf("[GetReplicasCustom] Deploying new function version with resources for %s in namespace %s, score: %d",
+				serviceName, serviceNamespace, scoreColdStart)
+			resp, err := s.DeployFunctionWithResources(serviceName, serviceNamespace, functions)
+			if err != nil {
+				log.Printf("[GetReplicasCustom] Error deploying function with resources: %v", err)
 				return emptyServiceQueryResponse, err
 			}
-		}
-		// // Look for a function with the same base name and a version suffix
-		// // Extract the base service name from the function name
-		// baseName := serviceName
-		// if idx := strings.Index(serviceName, "-"); idx != -1 {
-		// 	baseName = serviceName[:idx]
-		// }
-		// log.Printf("Base service name: %s", baseName)
-
-		// 	alternativeFunction, err := FindAlternativeFunctionVersion(serviceName, baseName, functions)
-		// 	if err != nil {
-		// 		return emptyServiceQueryResponse, fmt.Errorf("error finding alternative function version: %w", err)
-		// 	}
-		// 	if alternativeFunction != nil {
-		// 		log.Printf("Found alternative function version: %s with available replicas: %d", serviceName, alternativeFunction.AvailableReplicas)
-		// 		return *alternativeFunction, nil
-		// 	}
-		// }
-
-		// ---------- SA - Implementing the logic to Deploy a new function with resources ----------
-		// Extract memory and CPU requirements from the requested function name
-		requestedMemory, requestedCPU := 0, 0
-		baseName := serviceName // Default to the original service name
-		if strings.Contains(serviceName, "-") {
-			parts := strings.Split(serviceName, "-")
-			if len(parts) >= 3 {
-				baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
-				requestedMemory, _ = strconv.Atoi(parts[1])
-				requestedCPU, _ = strconv.Atoi(parts[2])
-			}
-		}
-
-		// If we have valid memory and CPU requirements, deploy a new function
-		if baseName != serviceName && requestedMemory > 0 && requestedCPU > 0 {
-			log.Printf("Deploying new function version with memory=%dMB, CPU=%d cores",
-				requestedMemory, requestedCPU)
-
-			newDeployment, err := s.DeployFunctionWithResources(
-				serviceName, baseName, serviceNamespace, requestedMemory, requestedCPU, functions)
-
-			if err != nil {
-				log.Printf("Failed to deploy new function: %v", err)
-			} else {
-				log.Printf("Successfully initiated deployment for %s", serviceName)
-				return *newDeployment, nil
-			}
-		}
-
-		log.Printf("[GetReplicasCustom] [%s.%s] took: %.4fs, code: %d\n", serviceName, serviceNamespace, time.Since(start).Seconds(), res.StatusCode)
-		return emptyServiceQueryResponse, fmt.Errorf("server returned non-200 status code (%d) for function, %s, body: %s", res.StatusCode, serviceName, string(bytesOut))
-	}
-
-	minReplicas := uint64(scaling.DefaultMinReplicas)
-	maxReplicas := uint64(scaling.DefaultMaxReplicas)
-	scalingFactor := uint64(scaling.DefaultScalingFactor)
-	availableReplicas := function.AvailableReplicas
-
-	if function.Labels != nil {
-		labels := *function.Labels
-
-		minReplicas = extractLabelValue(labels[scaling.MinScaleLabel], minReplicas)
-		maxReplicas = extractLabelValue(labels[scaling.MaxScaleLabel], maxReplicas)
-		extractedScalingFactor := extractLabelValue(labels[scaling.ScalingFactorLabel], scalingFactor)
-
-		if extractedScalingFactor > 0 && extractedScalingFactor <= 100 {
-			scalingFactor = extractedScalingFactor
+			log.Printf("[GetReplicasCustom] Successfully deployed new function version with resources for %s in namespace %s",
+				serviceName, serviceNamespace)
+			return resp, nil
 		} else {
-			return scaling.ServiceQueryResponse{}, fmt.Errorf("bad scaling factor: %d, is not in range of [0 - 100]", extractedScalingFactor)
-		}
-	}
+			log.Printf("[GetReplicasCustom] No need to deploy new function version with resources for %s in namespace %s, score: %d",
+				serviceName, serviceNamespace, scoreColdStart)
+			// Prepare the response with the first available version
+			return prepareVersionResponse(alternateVersionList[0])
 
-	return scaling.ServiceQueryResponse{
-		Replicas:          function.Replicas,
-		MaxReplicas:       maxReplicas,
-		MinReplicas:       minReplicas,
-		ScalingFactor:     scalingFactor,
-		AvailableReplicas: availableReplicas,
-		Annotations:       function.Annotations,
-	}, err
+		}
+
+	}
+	log.Printf("[GetReplicasCustom] [%s.%s] took: %.4fs, code: %d\n", serviceName, serviceNamespace, time.Since(start).Seconds(), res.StatusCode)
+	return prepareResponse(function)
 }
 
 // SetReplicas update the replica count
-func (s ExternalServiceQuery) SetReplicas(serviceName, serviceNamespace string, count uint64) error {
+func (s *ExternalServiceQuery) SetReplicas(serviceName, serviceNamespace string, count uint64) error {
 	var err error
 
 	scaleReq := types.ScaleServiceRequest{
@@ -318,8 +282,213 @@ func extractLabelValue(rawLabelValue string, fallback uint64) uint64 {
 	return uint64(value)
 }
 
+// Helper function to prepare the Version response
+func prepareResponse(function types.FunctionStatus) (scaling.ServiceQueryResponse, error) {
+	var emptyServiceQueryResponse scaling.ServiceQueryResponse
+	fn := function
+	log.Printf("[prepareResponse] Found function version: %s with available replicas: %d",
+		fn.Name, fn.AvailableReplicas)
+	minReplicas := uint64(scaling.DefaultMinReplicas)
+	maxReplicas := uint64(scaling.DefaultMaxReplicas)
+	scalingFactor := uint64(scaling.DefaultScalingFactor)
+	if fn.Labels != nil {
+		labels := *fn.Labels
+		minReplicas = extractLabelValue(labels[scaling.MinScaleLabel], minReplicas)
+		maxReplicas = extractLabelValue(labels[scaling.MaxScaleLabel], maxReplicas)
+		extractedScalingFactor := extractLabelValue(labels[scaling.ScalingFactorLabel], scalingFactor)
+		if extractedScalingFactor > 0 && extractedScalingFactor <= 100 {
+			scalingFactor = extractedScalingFactor
+		} else {
+			return emptyServiceQueryResponse, fmt.Errorf("[prepareResponse] bad scaling factor: %d, is not in range of [0 - 100]", extractedScalingFactor)
+		}
+	}
+	if fn.Annotations == nil {
+		fn.Annotations = &map[string]string{}
+	}
+	annotations := fn.Annotations
+	if annotations == nil {
+		m := make(map[string]string)
+		annotations = &m
+	}
+
+	queryRes := scaling.ServiceQueryResponse{
+		Replicas:          fn.Replicas,
+		MaxReplicas:       maxReplicas,
+		MinReplicas:       minReplicas,
+		ScalingFactor:     scalingFactor,
+		AvailableReplicas: fn.AvailableReplicas,
+		Annotations:       annotations,
+	}
+	return queryRes, nil
+}
+
+// Helper function to prepare the Version response
+func prepareVersionResponse(function struct {
+	Function types.FunctionStatus
+	MemoryMB uint64
+	CPU      uint64
+	Score    uint64
+}) (scaling.ServiceQueryResponse, error) {
+	var emptyServiceQueryResponse scaling.ServiceQueryResponse
+	fn := function.Function
+	log.Printf("[prepareVersionResponse] Found alternative function version: %s with available replicas: %d",
+		fn.Name, fn.AvailableReplicas)
+	minReplicas := uint64(scaling.DefaultMinReplicas)
+	maxReplicas := uint64(scaling.DefaultMaxReplicas)
+	scalingFactor := uint64(scaling.DefaultScalingFactor)
+	if fn.Labels != nil {
+		labels := *fn.Labels
+		minReplicas = extractLabelValue(labels[scaling.MinScaleLabel], minReplicas)
+		maxReplicas = extractLabelValue(labels[scaling.MaxScaleLabel], maxReplicas)
+		extractedScalingFactor := extractLabelValue(labels[scaling.ScalingFactorLabel], scalingFactor)
+		if extractedScalingFactor > 0 && extractedScalingFactor <= 100 {
+			scalingFactor = extractedScalingFactor
+		} else {
+			return emptyServiceQueryResponse, fmt.Errorf("[prepareVersionResponse] bad scaling factor: %d, is not in range of [0 - 100]", extractedScalingFactor)
+		}
+	}
+	if fn.Annotations == nil {
+		fn.Annotations = &map[string]string{}
+	}
+	annotations := fn.Annotations
+	if annotations == nil {
+		m := make(map[string]string)
+		annotations = &m
+	}
+	(*annotations)["version_found"] = fn.Name
+	(*annotations)["version_checked"] = "true"
+	queryRes := scaling.ServiceQueryResponse{
+		Replicas:          fn.Replicas,
+		MaxReplicas:       maxReplicas,
+		MinReplicas:       minReplicas,
+		ScalingFactor:     scalingFactor,
+		AvailableReplicas: fn.AvailableReplicas,
+		Annotations:       annotations,
+	}
+	return queryRes, nil
+}
+
+// SA - Helper function for absolute value
+func abs(x, y uint64) uint64 {
+	if x > y {
+		return x - y
+	}
+	return y - x
+}
+
+// SA - GetFunctionPodStatus retrieves the pod status for a specific function
+func (s *ExternalServiceQuery) GetFunctionPodStatus(functionName, functionNamespace string) (bool, error) {
+
+	key := fmt.Sprintf("%s-%s", "GetFunctionPodStatus", functionName)
+	result, err, _ := s.deployGroup.Do(key, func() (interface{}, error) {
+		urlPath := fmt.Sprintf("%ssystem/podstatus/query?functionName=%s&namespace=%s",
+			s.URL.String(),
+			functionName,
+			functionNamespace)
+
+		req, err := http.NewRequest(http.MethodGet, urlPath, nil)
+		if err != nil {
+			return false, err
+		}
+
+		if s.AuthInjector != nil {
+			s.AuthInjector.Inject(req)
+		}
+
+		res, err := s.ProxyClient.Do(req)
+		if err != nil {
+			log.Println(urlPath, err)
+			return false, err
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode == http.StatusNotFound {
+			// No pods found for the function, return false
+			// Maybe first time since the cache was cleared
+			log.Printf("[GetFunctionPodStatus] No pods found for function %s in namespace %s", functionName, functionNamespace)
+			return true, nil
+		} else if res.StatusCode != http.StatusOK {
+			// Unexpected status code, return an error
+			body, _ := io.ReadAll(res.Body)
+			return false, fmt.Errorf("[GetFunctionPodStatus] server returned non-200 status code (%d) for function %s in namespace %s, body: %s",
+				res.StatusCode, functionName, functionNamespace, string(body))
+		}
+
+		if res.StatusCode == http.StatusOK {
+			// SA - Function exists in deployment, unmarshal the response
+			var podStatuses []types.PodStatus
+			bytesOut, _ := io.ReadAll(res.Body)
+			// Trim whitespace to check for empty or "{}"
+			trimmed := strings.TrimSpace(string(bytesOut))
+			if trimmed == "" || trimmed == "{}" || trimmed == "no pods found" || trimmed == "no pods found\n" {
+				// Empty response, treat as no pods found (not an error)
+				podStatuses = []types.PodStatus{}
+				return true, nil // maybe first time since the cache was cleared
+			} else {
+				if err := json.Unmarshal(bytesOut, &podStatuses); err != nil {
+					log.Printf("[GetFunctionPodStatus] Unable to unmarshal pod status: %q, %s", string(bytesOut), err)
+					return false, err
+				}
+			}
+
+			// Found the pod statuses for the function
+			if len(podStatuses) > 0 {
+				idlePods := 0
+				for _, pod := range podStatuses {
+					if pod.Status == "idle" {
+						idlePods++
+						break // We found at least one idle pod, no need to continue checking
+					}
+				}
+				// The current function has idle pods and therefore continue with the current function
+				// i.e., the default logic of forwarding the request to the function
+				return true, nil
+			}
+		}
+
+		// No idle pods found, return false to indicate that the function is busy
+		return false, nil
+	})
+	if err != nil {
+		log.Printf("[GetFunctionPodStatus] Error getting pod status for function %s in namespace %s: %v", functionName, functionNamespace, err)
+		return false, err
+	}
+
+	return result.(bool), nil
+}
+
 // SA - FindAlternativeFunctionVersion searches for an alternative function version with available replicas.
-func FindAlternativeFunctionVersion(serviceName, baseName string, functions []types.FunctionStatus) (*scaling.ServiceQueryResponse, error) {
+func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string,
+	serviceNamespace string,
+	functions []types.FunctionStatus) ([]struct {
+	Function types.FunctionStatus
+	MemoryMB uint64
+	CPU      uint64
+	Score    uint64
+}, error) {
+
+	var matchedFunctions []struct {
+		Function types.FunctionStatus
+		MemoryMB uint64
+		CPU      uint64
+		Score    uint64
+	}
+
+	// Look for a function with the same base name and a version suffix
+	// Extract the base service name from the function name
+	requestedMemory, requestedCPU := uint64(512), uint64(1)
+	baseName := serviceName // Default to the original service name
+	if strings.Contains(serviceName, "-") {
+		parts := strings.Split(serviceName, "-")
+		if len(parts) >= 3 {
+			baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
+			requestedMemory, _ = strconv.ParseUint(parts[1], 10, 64)
+			requestedCPU, _ = strconv.ParseUint(parts[2], 10, 64)
+		}
+	}
+	log.Printf("[FindAlternativeVersion] Base service name: %s", baseName)
+	log.Printf("[FindAlternativeVersion] Checking for available versions of function: %s in namespace: %s", serviceName, serviceNamespace)
+
 	pattern := fmt.Sprintf(`^%s-\d+-\d+$`, regexp.QuoteMeta(baseName))
 	re := regexp.MustCompile(pattern)
 
@@ -328,144 +497,226 @@ func FindAlternativeFunctionVersion(serviceName, baseName string, functions []ty
 			continue // skip the original function
 		}
 		if re.MatchString(fn.Name) && fn.AvailableReplicas > 0 {
-			minReplicas := uint64(scaling.DefaultMinReplicas)
-			maxReplicas := uint64(scaling.DefaultMaxReplicas)
-			scalingFactor := uint64(scaling.DefaultScalingFactor)
-			availableReplicas := fn.AvailableReplicas
+			// If the function is matched, check for idle pods
+			podFound, err := s.GetFunctionPodStatus(fn.Name, serviceNamespace)
+			if err != nil {
+				log.Printf("[FindAlternativeVersion] Error checking for idle pods: %v", err)
+				continue
+			}
+			if !podFound {
+				continue // skip the function if it has no idle pods
+			}
+			log.Printf("[FindAlternativeVersion] Found alternative function version: %s with available memory: %s and cpu: %s",
+				fn.Name, fn.Requests.Memory, fn.Requests.CPU)
+			// If we found a function with the same base name, use its configuration
+			var memory, cpu uint64
+			if fn.Requests != nil {
+				memory, _ = strconv.ParseUint(fn.Requests.Memory, 10, 64)
+				cpu, _ = strconv.ParseUint(fn.Requests.CPU, 10, 64)
+			}
+			if memory == 0 && fn.Limits != nil {
+				memory, _ = strconv.ParseUint(fn.Limits.Memory, 10, 64)
+			}
+			if cpu == 0 && fn.Limits != nil {
+				cpu, _ = strconv.ParseUint(fn.Limits.CPU, 10, 64)
+			}
+			// Calculate the score based on the difference between requested and available resources
+			score := abs(memory, requestedMemory) + abs(cpu, requestedCPU)
 
-			if fn.Labels != nil {
-				labels := *fn.Labels
-				minReplicas = extractLabelValue(labels[scaling.MinScaleLabel], minReplicas)
-				maxReplicas = extractLabelValue(labels[scaling.MaxScaleLabel], maxReplicas)
-				extractedScalingFactor := extractLabelValue(labels[scaling.ScalingFactorLabel], scalingFactor)
-				if extractedScalingFactor > 0 && extractedScalingFactor <= 100 {
-					scalingFactor = extractedScalingFactor
-				} else {
-					return nil, fmt.Errorf("bad scaling factor: %d, is not in range of [0 - 100]", extractedScalingFactor)
-				}
-			}
-
-			if fn.Annotations == nil {
-				fn.Annotations = &map[string]string{}
-			}
-			annotations := fn.Annotations
-			if annotations == nil {
-				m := make(map[string]string)
-				annotations = &m
-			}
-			(*annotations)["version_found"] = fn.Name
-			(*annotations)["version_checked"] = "true"
-
-			resp := scaling.ServiceQueryResponse{
-				Replicas:          fn.Replicas,
-				MaxReplicas:       maxReplicas,
-				MinReplicas:       minReplicas,
-				ScalingFactor:     scalingFactor,
-				AvailableReplicas: availableReplicas,
-				Annotations:       annotations,
-			}
-			return &resp, nil
+			matchedFunctions = append(matchedFunctions, struct {
+				Function types.FunctionStatus
+				MemoryMB uint64
+				CPU      uint64
+				Score    uint64
+			}{
+				Function: fn,
+				MemoryMB: memory,
+				CPU:      cpu,
+				Score:    score,
+			})
 		}
 	}
-	return nil, nil
+
+	if len(matchedFunctions) == 0 {
+		log.Printf("[FindAlternativeVersion] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
+		return matchedFunctions, fmt.Errorf("[FindAlternativeVersion] no alternative function version found for %s in namespace %s",
+			serviceName, serviceNamespace)
+	}
+	// Sort matched functions by score (lower is better)
+	sort.Slice(matchedFunctions, func(i, j int) bool {
+		return matchedFunctions[i].Score < matchedFunctions[j].Score
+	})
+
+	return matchedFunctions, nil
+}
+
+// Helper function to get the function list
+func (s *ExternalServiceQuery) GetFunctionList(serviceNamespace string) ([]types.FunctionStatus, error) {
+	var functions []types.FunctionStatus
+
+	// SA - Get the list of functions from the external service
+	key := fmt.Sprintf("%s-%s", "GetFunctionList", serviceNamespace)
+	result, err, _ := s.deployGroup.Do(key, func() (interface{}, error) {
+		// Use singleflight to ensure that only one request is processed at a time
+		listURL := fmt.Sprintf("%ssystem/functions?namespace=%s", s.URL.String(), serviceNamespace)
+		listReq, err := http.NewRequest(http.MethodGet, listURL, nil)
+		if err != nil {
+			return functions, err
+		}
+		if s.AuthInjector != nil {
+			s.AuthInjector.Inject(listReq)
+		}
+		listRes, err := s.ProxyClient.Do(listReq)
+		if err != nil {
+			log.Println(listURL, err)
+			return functions, err
+		}
+		defer listRes.Body.Close()
+
+		if listRes.StatusCode == http.StatusOK {
+			listBytes, _ := io.ReadAll(listRes.Body)
+			if err := json.Unmarshal(listBytes, &functions); err != nil {
+				log.Printf("[GetFunctionList] Unable to unmarshal function list: %q, %s", string(listBytes), err)
+				return functions, err
+			}
+		}
+
+		return functions, nil
+	})
+	if err != nil {
+		log.Printf("[GetFunctionList] Error getting function list: %v", err)
+		return functions, err
+	}
+	return result.([]types.FunctionStatus), nil
+
 }
 
 // SA - DeployFunctionWithResources creates a new function deployment with specified resources
-func (s ExternalServiceQuery) DeployFunctionWithResources(originalName, baseServiceName, serviceNamespace string,
-	memoryMB, cpuCores int, functions []types.FunctionStatus) (*scaling.ServiceQueryResponse, error) {
-	// 1. Get the original function definition (if it exists)
-	var originalFunction types.FunctionStatus
+func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceNamespace string,
+	functions []types.FunctionStatus) (scaling.ServiceQueryResponse, error) {
 
-	// baseServiceName is just the name of the function without any resource suffix
-	// therefore, first find any existing function with the same base name
-	pattern := fmt.Sprintf(`^%s-\d+-\d+$`, regexp.QuoteMeta(baseServiceName))
-	re := regexp.MustCompile(pattern)
+	var emptyServiceQueryResponse scaling.ServiceQueryResponse
 
-	for _, fn := range functions {
-		if fn.Name == baseServiceName {
-			continue // skip the original function
+	// Use singleflight to ensure that only one deployment request is processed at a time
+	key := fmt.Sprintf("%s-%s-%s", "DeployFunctionWithResources", serviceName, serviceNamespace)
+	result, err, _ := s.deployGroup.Do(key, func() (interface{}, error) {
+		// Look for a function with the same base name and a version suffix
+		// Extract the base service name from the function name
+		var requestedMemory, requestedCPU int
+		baseName := serviceName     // Default to the original service name
+		originalName := serviceName // Store the original name for annotations
+		if strings.Contains(serviceName, "-") {
+			parts := strings.Split(serviceName, "-")
+			if len(parts) >= 3 {
+				baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
+				requestedMemory, _ = strconv.Atoi(parts[1])
+				requestedCPU, _ = strconv.Atoi(parts[2])
+			}
 		}
-		if re.MatchString(fn.Name) && fn.AvailableReplicas > 0 {
-			// If we found a function with the same base name, use its configuration
-			originalFunction = fn
-			log.Printf("Found existing function with base name %s: %s", baseServiceName, fn.Name)
-			break
+		log.Printf("[DeployFunctionWithResources] Base service name: %s", baseName)
+
+		if baseName != serviceName && requestedMemory > 0 && requestedCPU > 0 {
+			log.Printf("[DeployFunctionWithResources] Deploying new function version with memory=%dMB, CPU=%d cores",
+				requestedMemory, requestedCPU)
 		}
-	}
+		// 1. Get the original function definition (if it exists)
+		var originalFunction types.FunctionStatus
+		// baseName is just the name of the function without any resource suffix
+		// therefore, first find any existing function with the same base name
+		pattern := fmt.Sprintf(`^%s-\d+-\d+$`, regexp.QuoteMeta(baseName))
+		re := regexp.MustCompile(pattern)
 
-	// 2. Create a new function with updated resources
-	newFunctionName := fmt.Sprintf("%s-%d-%d", baseServiceName, memoryMB, cpuCores)
+		for _, fn := range functions {
+			if fn.Name == baseName {
+				continue // skip the original function
+			}
+			if re.MatchString(fn.Name) && fn.AvailableReplicas > 0 {
+				// If we found a function with the same base name, use its configuration
+				originalFunction = fn
+				log.Printf("[DeployFunctionWithResources] Found existing function with base name %s: %s", baseName, fn.Name)
+				break
+			}
+		}
 
-	// Create deployment request
-	deployReq := types.FunctionDeployment{
-		Service:     newFunctionName,
-		Image:       originalFunction.Image,
-		EnvProcess:  originalFunction.EnvProcess,
-		EnvVars:     originalFunction.EnvVars,
-		Constraints: originalFunction.Constraints,
-		Secrets:     originalFunction.Secrets,
-		Labels:      originalFunction.Labels,
-		Annotations: originalFunction.Annotations,
-		Namespace:   serviceNamespace,
-		Limits: &types.FunctionResources{
-			Memory: fmt.Sprintf("%dMi", memoryMB),
-			CPU:    fmt.Sprintf("%dm", cpuCores*1000), // Convert to millicores i.e. x core = x*10 millicores
-		},
-		Requests: &types.FunctionResources{
-			Memory: fmt.Sprintf("%dMi", memoryMB),
-			CPU:    fmt.Sprintf("%dm", cpuCores*1000), // Convert to millicores
-		},
-	}
+		// 2. Create a new function with updated resources
+		newFunctionName := fmt.Sprintf("%s-%d-%d", baseName, requestedMemory, requestedCPU)
 
-	// Update the Labels on the new function deployment
-	if deployReq.Labels == nil {
-		deployReq.Labels = &map[string]string{}
-	}
-	(*deployReq.Labels)["faas_function"] = newFunctionName
+		// Create deployment request
+		deployReq := types.FunctionDeployment{
+			Service:     newFunctionName,
+			Image:       originalFunction.Image,
+			EnvProcess:  originalFunction.EnvProcess,
+			EnvVars:     originalFunction.EnvVars,
+			Constraints: originalFunction.Constraints,
+			Secrets:     originalFunction.Secrets,
+			Labels:      originalFunction.Labels,
+			Annotations: originalFunction.Annotations,
+			Namespace:   serviceNamespace,
+			Limits: &types.FunctionResources{
+				Memory: fmt.Sprintf("%dMi", requestedMemory),
+				CPU:    fmt.Sprintf("%dm", requestedCPU), // CPU in millicores
+			},
+			Requests: &types.FunctionResources{
+				Memory: fmt.Sprintf("%dMi", requestedMemory),
+				CPU:    fmt.Sprintf("%dm", requestedCPU), // CPU to millicores
+			},
+		}
 
-	// 3. Deploy the new function
-	deployBody, err := json.Marshal(deployReq)
+		// Update the Labels on the new function deployment
+		if deployReq.Labels == nil {
+			deployReq.Labels = &map[string]string{}
+		}
+		(*deployReq.Labels)["faas_function"] = newFunctionName
+
+		// 3. Deploy the new function
+		deployBody, err := json.Marshal(deployReq)
+		if err != nil {
+			return emptyServiceQueryResponse, err
+		}
+
+		deployURL := fmt.Sprintf("%ssystem/functions", s.URL.String())
+		deployReqRes, err := http.NewRequest(http.MethodPost, deployURL, bytes.NewReader(deployBody))
+		if err != nil {
+			return emptyServiceQueryResponse, err
+		}
+
+		if s.AuthInjector != nil {
+			s.AuthInjector.Inject(deployReqRes)
+		}
+
+		deployRes, err := s.ProxyClient.Do(deployReqRes)
+		if err != nil {
+			return emptyServiceQueryResponse, err
+		}
+		defer deployRes.Body.Close()
+
+		if deployRes.StatusCode != http.StatusOK && deployRes.StatusCode != http.StatusAccepted {
+			body, _ := io.ReadAll(deployRes.Body)
+			return emptyServiceQueryResponse, fmt.Errorf("[DeployFunctionWithResources] Failed to deploy function: %s, status: %d, body: %s",
+				newFunctionName, deployRes.StatusCode, string(body))
+		}
+
+		// 4. Return a response that indicates the function is being deployed
+		resp := scaling.ServiceQueryResponse{
+			Replicas:          0, // Start with 0 replica to let the Scaler do minimum scale up
+			MaxReplicas:       uint64(scaling.DefaultMaxReplicas),
+			MinReplicas:       uint64(scaling.DefaultMinReplicas),
+			ScalingFactor:     uint64(scaling.DefaultScalingFactor),
+			AvailableReplicas: 0, // Initially 0 until deployment completes
+			Annotations: &map[string]string{
+				"dynamic_deployment": "true",
+				"original_request":   originalName,
+				"base_function":      baseName,
+				"memory_mb":          fmt.Sprintf("%d", requestedMemory),
+				"cpu_cores":          fmt.Sprintf("%d", requestedCPU),
+			},
+		}
+		return resp, nil
+	})
 	if err != nil {
-		return nil, err
+		log.Printf("[DeployFunctionWithResources] Error deploying function with resources: %v", err)
+		return emptyServiceQueryResponse, err
 	}
-
-	deployURL := fmt.Sprintf("%ssystem/functions", s.URL.String())
-	deployReqRes, err := http.NewRequest(http.MethodPost, deployURL, bytes.NewReader(deployBody))
-	if err != nil {
-		return nil, err
-	}
-
-	if s.AuthInjector != nil {
-		s.AuthInjector.Inject(deployReqRes)
-	}
-
-	deployRes, err := s.ProxyClient.Do(deployReqRes)
-	if err != nil {
-		return nil, err
-	}
-	defer deployRes.Body.Close()
-
-	if deployRes.StatusCode != http.StatusOK && deployRes.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(deployRes.Body)
-		return nil, fmt.Errorf("failed to deploy function: %s, status: %d, body: %s",
-			newFunctionName, deployRes.StatusCode, string(body))
-	}
-
-	// 4. Return a response that indicates the function is being deployed
-	resp := scaling.ServiceQueryResponse{
-		Replicas:          0, // Start with 0 replica to let the Scaler do minimum scale up
-		MaxReplicas:       uint64(scaling.DefaultMaxReplicas),
-		MinReplicas:       uint64(scaling.DefaultMinReplicas),
-		ScalingFactor:     uint64(scaling.DefaultScalingFactor),
-		AvailableReplicas: 0, // Initially 0 until deployment completes
-		Annotations: &map[string]string{
-			"dynamic_deployment": "true",
-			"original_request":   originalName,
-			"base_function":      baseServiceName,
-			"memory_mb":          fmt.Sprintf("%d", memoryMB),
-			"cpu_cores":          fmt.Sprintf("%d", cpuCores),
-		},
-	}
-
-	return &resp, nil
+	// Return the result from the singleflight group
+	return result.(scaling.ServiceQueryResponse), nil
 }
