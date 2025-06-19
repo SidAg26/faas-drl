@@ -48,6 +48,13 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
   - Registered a new HTTP handler for `/system/podstatus/{status}` in the provider's router (see `main.go`), using `handlers.MakePodIdleHandler`.
   - Ensured the provider exposes this endpoint so the gateway can mark pods as busy or idle.
 
+- **Cache Consistency and Pruning**
+  - Ensured the pod status cache is pruned/updated with the latest Kubernetes endpoint addresses before returning results from `GetByFunction`.
+  - Improved documentation and code patterns for fetching endpoint addresses and pruning the cache for up-to-date pod status reporting.
+
+- **Efficiency Improvements**
+  - Optimized `PruneByAddresses` to avoid double iteration over the cache and endpoint addresses, improving performance for large clusters.
+
 ### faas-drl/gateway
 
 - **Enhanced notifiers and logging**:
@@ -66,6 +73,29 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
   - Updated notifier and logging logic to include pod status transitions for observability.
   - Ensured the gateway is configurable to point to the correct provider URL for pod status updates.
 
+- **Robust Pod Status Fetching and Error Handling**
+  - Improved `GetFunctionPodStatus` to check HTTP status codes before attempting to unmarshal the response body.
+  - Added logic to handle non-JSON and empty responses (e.g., plain text "no pods found" or `{}`), preventing unmarshal panics.
+  - Enhanced error logging for HTTP and JSON errors in pod status handling.
+
+- **Function Version Checking and Deployment Scoring Logic**
+  - Improved `GetReplicas` external service to check for function availability
+  - Check for idle pods, if not then check for other available versions
+  - Check for other version's idle pod, if not then decide to deploy the current function
+  as per the request
+  - If the function does not exist as per the request, **Greedy Scoring** for `cold start` cost and
+  `warm re-use` cost and proceed accordingly
+
+- **Thread Safety and Concurrency**
+  - Switched all methods on `ExternalServiceQuery` to use pointer receivers to avoid copying structs containing mutexes (e.g., `singleflight.Group`).
+  - Made `DeployFunctionWithResources` thread-safe by deduplicating concurrent deployments for the same function version using `singleflight.Group`.
+
+- **Nil Pointer and Panic Prevention**
+  - Added nil checks for `fn.Requests` and `fn.Limits` in `FindAlternativeFunctionVersion` to prevent nil pointer dereference panics.
+
+- **Error Based Scaling**
+  - Turned Off error-based scaling for this version to test the scoring and version checking logic
+
 ### faas-provider-openfaas
 
 - **Custom logic in proxy/proxy.go**:
@@ -78,6 +108,7 @@ This document tracks all recent changes and customizations made to the OpenFaaS 
   - Implemented methods for querying/updating pod statuses.
   - (If used as a base for the provider) Ensured the `serve.go` and router setup allow for custom handler registration, including `/system/podstatus/{status}`.
   - Registered a new HTTP handler for `/system/podstatus/{status}` in the provider's router (see `main.go`), using `handlers.MakePodIdleHandler`.
+  - Registered a new HTTP handler for `/system/podstatus/query` in the provider's router (see `main.go`), using `handlers.MakePodsStatusFetchHandler`.
   - Ensured the provider exposes this endpoint so the gateway can mark pods as busy or idle.
 
 - **Custom Deployment & Pod Version Checking**:
