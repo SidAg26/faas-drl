@@ -9,6 +9,7 @@ package scaling
 type ServiceQuery interface {
 	GetReplicas(service, namespace string) (response ServiceQueryResponse, err error)
 	SetReplicas(service, namespace string, count uint64) error
+	// SA - Expose the custom GetReplicas method to allow for custom implementations
 	GetReplicasCustom(service, namespace string) (response ServiceQueryResponse, err error)
 }
 
