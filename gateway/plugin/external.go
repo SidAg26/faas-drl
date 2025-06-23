@@ -15,8 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
-	"math/rand" // SA - Importing math/rand to use random number generation
+	"log" // SA - Importing math/rand to use random number generation
 	"net"
 	"net/http"
 	"net/url"
@@ -76,6 +75,88 @@ func NewExternalServiceQuery(externalURL url.URL, authInjector middleware.AuthIn
 
 // GetReplicas replica count for function
 func (s *ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string) (scaling.ServiceQueryResponse, error) {
+	start := time.Now()
+
+	var err error
+	var emptyServiceQueryResponse scaling.ServiceQueryResponse
+
+	function := types.FunctionStatus{}
+
+	urlPath := fmt.Sprintf("%ssystem/function/%s?namespace=%s&usage=%v",
+		s.URL.String(),
+		serviceName,
+		serviceNamespace,
+		s.IncludeUsage)
+
+	req, err := http.NewRequest(http.MethodGet, urlPath, nil)
+	if err != nil {
+		return emptyServiceQueryResponse, err
+	}
+
+	if s.AuthInjector != nil {
+		s.AuthInjector.Inject(req)
+	}
+
+	res, err := s.ProxyClient.Do(req)
+	if err != nil {
+		log.Println(urlPath, err)
+		return emptyServiceQueryResponse, err
+
+	}
+
+	var bytesOut []byte
+	if res.Body != nil {
+		bytesOut, _ = io.ReadAll(res.Body)
+		defer res.Body.Close()
+	}
+
+	if res.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(bytesOut, &function); err != nil {
+			log.Printf("Unable to unmarshal: %q, %s", string(bytesOut), err)
+			return emptyServiceQueryResponse, err
+		}
+
+		// log.Printf("GetReplicas [%s.%s] took: %fs", serviceName, serviceNamespace, time.Since(start).Seconds())
+
+	} else {
+		log.Printf("GetReplicas [%s.%s] took: %.4fs, code: %d\n", serviceName, serviceNamespace, time.Since(start).Seconds(), res.StatusCode)
+		return emptyServiceQueryResponse, fmt.Errorf("server returned non-200 status code (%d) for function, %s, body: %s", res.StatusCode, serviceName, string(bytesOut))
+	}
+
+	minReplicas := uint64(scaling.DefaultMinReplicas)
+	maxReplicas := uint64(scaling.DefaultMaxReplicas)
+	scalingFactor := uint64(scaling.DefaultScalingFactor)
+	availableReplicas := function.AvailableReplicas
+
+	if function.Labels != nil {
+		labels := *function.Labels
+
+		minReplicas = extractLabelValue(labels[scaling.MinScaleLabel], minReplicas)
+		maxReplicas = extractLabelValue(labels[scaling.MaxScaleLabel], maxReplicas)
+		extractedScalingFactor := extractLabelValue(labels[scaling.ScalingFactorLabel], scalingFactor)
+
+		if extractedScalingFactor > 0 && extractedScalingFactor <= 100 {
+			scalingFactor = extractedScalingFactor
+		} else {
+			return scaling.ServiceQueryResponse{}, fmt.Errorf("bad scaling factor: %d, is not in range of [0 - 100]", extractedScalingFactor)
+		}
+	}
+
+	return scaling.ServiceQueryResponse{
+		Replicas:          function.Replicas,
+		MaxReplicas:       maxReplicas,
+		MinReplicas:       minReplicas,
+		ScalingFactor:     scalingFactor,
+		AvailableReplicas: availableReplicas,
+		Annotations:       function.Annotations,
+	}, err
+}
+
+// SA - Create a new GetReplicas function that will not overlap the exisitng logic at multiple places
+// GetReplicas is called in the following places:
+// alerthandler.go - to scale the function based on alerts
+// scaling/function_scaler.go - to scale the function based on the current replicas, checks repelicas and available replicas
+func (s *ExternalServiceQuery) GetReplicasCustom(serviceName, serviceNamespace string) (scaling.ServiceQueryResponse, error) {
 	start := time.Now()
 
 	var err error
@@ -190,12 +271,7 @@ func (s *ExternalServiceQuery) GetReplicas(serviceName, serviceNamespace string)
 
 		// SA - 5. Score the deployment scheme (cold start)
 		// For now, we will use a simple scoring mechanism based on the version score
-		lower := uint64(float64(scoreVersion) * 0.8)
-		upper := max(uint64(float64(scoreVersion)*1.2), lower)
-		scoreColdStart := lower
-		if upper > lower {
-			scoreColdStart = lower + uint64(rand.Int63n(int64(upper-lower+1)))
-		}
+		scoreColdStart := ScoreColdStart(scoreVersion)
 
 		// SA - 6. If the cold start is better, then deploy a new function with requested resources
 		if scoreColdStart < scoreVersion || scoreVersion == 0 {
@@ -368,14 +444,6 @@ func prepareVersionResponse(function struct {
 	return queryRes, nil
 }
 
-// SA - Helper function for absolute value
-func abs(x, y uint64) uint64 {
-	if x > y {
-		return x - y
-	}
-	return y - x
-}
-
 // SA - GetFunctionPodStatus retrieves the pod status for a specific function
 func (s *ExternalServiceQuery) GetFunctionPodStatus(functionName, functionNamespace string) (bool, error) {
 
@@ -521,7 +589,8 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 				cpu, _ = strconv.ParseUint(fn.Limits.CPU, 10, 64)
 			}
 			// Calculate the score based on the difference between requested and available resources
-			score := abs(memory, requestedMemory) + abs(cpu, requestedCPU)
+			// score := abs(memory, requestedMemory) + abs(cpu, requestedCPU)
+			score := ScorePodAlternative(memory, requestedMemory, cpu, requestedCPU)
 
 			matchedFunctions = append(matchedFunctions, struct {
 				Function types.FunctionStatus
