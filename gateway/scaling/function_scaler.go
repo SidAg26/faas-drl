@@ -79,7 +79,10 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 		// then we check for other available versions in the format "functionName-{memory}-{CPU}"
 		// If the function is not found, then we return an error
 		// If the function is found, then we return the replicas and available replicas
-		return f.Config.ServiceQuery.GetReplicas(functionName, namespace)
+		// return f.Config.ServiceQuery.GetReplicas(functionName, namespace)
+		// SA - Replace this with the custom GetReplicas function
+		// that includes the version checking logic
+		return f.Config.ServiceQuery.GetReplicasCustom(functionName, namespace)
 	})
 
 	if err != nil {
@@ -142,6 +145,13 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 		scaleResult := types.Retry(func(attempt int) error {
 
 			res, err, _ := f.SingleFlight.Do(getKey, func() (interface{}, error) {
+				// SA - Keeping this as the original GetReplicas function
+				// that does not include the version checking logic.
+				// But, check for the version matching logic
+				if queryResponse.Annotations != nil && (*queryResponse.Annotations)["version_checked"] == "true" {
+					version := (*queryResponse.Annotations)["version_found"]
+					return f.Config.ServiceQuery.GetReplicas(version, namespace)
+				}
 				return f.Config.ServiceQuery.GetReplicas(functionName, namespace)
 			})
 
@@ -150,12 +160,24 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 			}
 
 			// Cache the response
-			queryResponse = res.(ServiceQueryResponse)
-			f.Cache.Set(functionName, namespace, queryResponse)
+			queryResponseCache := res.(ServiceQueryResponse)
+			// SA - Check if the cached response has the "version_checked" annotation
+			// If the annotation is present, then the function was matched with
+			// any other version of the function
+			if queryResponse.Annotations != nil && (*queryResponse.Annotations)["version_checked"] == "true" {
+				versionFound := (*queryResponse.Annotations)["version_found"]
+				if queryResponseCache.Annotations == nil {
+					queryResponseCache.Annotations = &map[string]string{}
+				} else {
+					(*queryResponseCache.Annotations)["version_checked"] = "true"
+					(*queryResponseCache.Annotations)["version_found"] = versionFound
+				}
+			}
+			f.Cache.Set(functionName, namespace, queryResponseCache)
 
 			// The scale up is complete because the desired replica count
 			// has been set to 1 or more.
-			if queryResponse.Replicas > 0 {
+			if queryResponseCache.Replicas > 0 {
 				return nil
 			}
 
@@ -163,14 +185,24 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 			setKey := fmt.Sprintf("SetReplicas-%s.%s", functionName, namespace)
 
 			if _, err, _ := f.SingleFlight.Do(setKey, func() (interface{}, error) {
+				// SA - Check for the version matching logic
+				if queryResponseCache.Annotations != nil && (*queryResponseCache.Annotations)["version_checked"] == "true" {
+					version := (*queryResponseCache.Annotations)["version_found"]
+					log.Printf("[FunctionScalerCustom %d/%d] function=%s 0 => %d requested for version %s",
+						attempt, int(f.Config.SetScaleRetries), version, minReplicas, functionName)
+					if err := f.Config.ServiceQuery.SetReplicas(version, namespace, minReplicas); err != nil {
+						return nil, fmt.Errorf("[FunctionScalerCustom] unable to scale function [%s], err: %s", version, err)
+					}
+					return nil, nil
+				} else {
+					log.Printf("[Scale %d/%d] function=%s 0 => %d requested",
+						attempt, int(f.Config.SetScaleRetries), functionName, minReplicas)
 
-				log.Printf("[Scale %d/%d] function=%s 0 => %d requested",
-					attempt, int(f.Config.SetScaleRetries), functionName, minReplicas)
-
-				if err := f.Config.ServiceQuery.SetReplicas(functionName, namespace, minReplicas); err != nil {
-					return nil, fmt.Errorf("unable to scale function [%s], err: %s", functionName, err)
+					if err := f.Config.ServiceQuery.SetReplicas(functionName, namespace, minReplicas); err != nil {
+						return nil, fmt.Errorf("unable to scale function [%s], err: %s", functionName, err)
+					}
+					return nil, nil
 				}
-				return nil, nil
 			}); err != nil {
 				return err
 			}
@@ -194,12 +226,31 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 	for i := 0; i < int(f.Config.MaxPollCount); i++ {
 
 		res, err, _ := f.SingleFlight.Do(getKey, func() (interface{}, error) {
+			// SA - Check for the version matching logic
+			if queryResponse.Annotations != nil && (*queryResponse.Annotations)["version_checked"] == "true" {
+				version := (*queryResponse.Annotations)["version_found"]
+				return f.Config.ServiceQuery.GetReplicas(version, namespace)
+			}
+			// SA - Keeping this as the original GetReplicas function
+			// that does not include the version checking logic.
 			return f.Config.ServiceQuery.GetReplicas(functionName, namespace)
 		})
-		queryResponse := res.(ServiceQueryResponse)
+		queryResponseHolding := res.(ServiceQueryResponse)
 
 		if err == nil {
-			f.Cache.Set(functionName, namespace, queryResponse)
+			// SA - Check if the cached response has the "version_checked" annotation
+			// If the annotation is present, then the function was matched with
+			// any other version of the function
+			if queryResponse.Annotations != nil && (*queryResponse.Annotations)["version_checked"] == "true" {
+				versionFound := (*queryResponse.Annotations)["version_found"]
+				if queryResponseHolding.Annotations == nil {
+					queryResponseHolding.Annotations = &map[string]string{}
+				} else {
+					(*queryResponseHolding.Annotations)["version_checked"] = "true"
+					(*queryResponseHolding.Annotations)["version_found"] = versionFound
+				}
+			}
+			f.Cache.Set(functionName, namespace, queryResponseHolding)
 		}
 
 		totalTime := time.Since(start)
@@ -213,7 +264,7 @@ func (f *FunctionScaler) Scale(functionName, namespace string) FunctionScaleResu
 			}
 		}
 
-		if queryResponse.AvailableReplicas > 0 {
+		if queryResponseHolding.AvailableReplicas > 0 {
 
 			log.Printf("[Ready] function=%s waited for - %.4fs", functionName, totalTime.Seconds())
 
