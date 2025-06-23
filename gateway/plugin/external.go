@@ -510,7 +510,14 @@ func (s *ExternalServiceQuery) GetFunctionPodStatus(functionName, functionNamesp
 				}
 				// The current function has idle pods and therefore continue with the current function
 				// i.e., the default logic of forwarding the request to the function
-				return true, nil
+				if idlePods > 0 {
+					log.Printf("[GetFunctionPodStatus] Function %s in namespace %s has atleast %d idle pods", functionName, functionNamespace, idlePods)
+					return true, nil // Function is idle, return true to indicate that the function is available
+				}
+				log.Printf("[GetFunctionPodStatus] Function %s in namespace %s has no idle pods", functionName, functionNamespace)
+				// No idle pods found, return false to indicate that the function is busy
+				// look for alternative solutions
+				return false, nil
 			}
 		}
 
