@@ -135,7 +135,7 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 		// If the request is not a function request, it will be sent once without retrying.
 		// The retry logic will retry the request up to 3 times with an exponential backoff
 		// The backoff will start at 200ms and double each time, up to a maximum of 3 retries.
-		maxRetries := 3
+		maxRetries := 1
 		baseDelay := 200 * time.Millisecond
 
 		var (
@@ -143,6 +143,9 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 			statusCode  string
 			statusCheck string
 			err         error
+			internalID  string
+			podIP       string
+			podName     string
 		)
 
 		if isFunctionRequest {
@@ -155,41 +158,41 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 					// We mark the pod as idle here to ensure that the pod is not marked as busy
 					// even if the request fails
 					if podStatusUpdater != nil {
-						_, podIP, podName := splitStatusCode(statusCode)
+						_, podIP, podName, internalID = splitStatusCode(statusCode)
 						if podName != "" && podIP != "" {
 							go func() {
 								if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
-									log.Printf("error marking pod as idle: %s\n", err.Error())
+									log.Printf("[CustomInternalID: %s] error marking pod as idle: %s\n", &internalID, err.Error())
 								}
 							}()
 							log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
 						}
 					}
 					backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
-					log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
+					log.Printf("[RequestID:%s, CustomInternalID: %s] Attempt %d: request to %s returned status %s, retrying in %v...", reqID, internalID, attempt, requestURL, statusCheck, backoff)
 					time.Sleep(backoff)
 					continue
 				}
-				statusCheck, _, _ = splitStatusCode(statusCode)
+				statusCheck, _, _, internalID = splitStatusCode(statusCode)
 				if statusCheck == strconv.Itoa(http.StatusOK) || statusCheck == strconv.Itoa((http.StatusAccepted)) {
 					break
 				}
 				if attempt < maxRetries {
 					// SA - mark the pod status as idle
 					if podStatusUpdater != nil {
-						_, podIP, podName := splitStatusCode(statusCode)
+						_, podIP, podName, internalID = splitStatusCode(statusCode)
 						if podName != "" && podIP != "" {
 							go func() {
 								if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
-									log.Printf("error marking pod as idle: %s\n", err.Error())
+									log.Printf("[RequestID:%s, CustomInternalID: %s] error marking pod as idle: %s\n", reqID, internalID, err.Error())
 								}
 							}()
-							log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
+							log.Printf("[RequestID:%s, CustomInternalID: %s] Pod %s marked as idle with IP %s\n", reqID, internalID, podName, podIP)
 						}
 
 					}
 					backoff := baseDelay * (1 << (attempt - 1)) // 100ms, 200ms, 400ms
-					log.Printf("Attempt %d: request to %s returned status %s, retrying in %v...", attempt, requestURL, statusCheck, backoff)
+					log.Printf("[RequestID:%s, CustomInternalID: %s] Attempt %d: request to %s returned status %s, retrying in %v...", reqID, internalID, attempt, requestURL, statusCheck, backoff)
 					time.Sleep(backoff)
 				}
 			}
@@ -201,21 +204,21 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 			rec.Body.WriteTo(w)
 
 			if statusCheck == strconv.Itoa(http.StatusOK) {
-				log.Printf("Request to %s succeeded with status %s within %d attempt(s)", requestURL, statusCheck, maxRetries)
+				log.Printf("[RequestID:%s, CustomInternalID: %s] Request to %s succeeded with status %s within %d attempt(s)", reqID, internalID, requestURL, statusCheck, maxRetries)
 			} else {
-				log.Printf("Request to %s failed after %d attempts, last status %s, error %s", requestURL, maxRetries, statusCheck, err)
+				log.Printf("[RequestID:%s, CustomInternalID: %s] Request to %s failed after %d attempts, last status %s, error %s", reqID, internalID, requestURL, maxRetries, statusCheck, err)
 			}
 
 			// SA - mark the pod status as idle
 			if podStatusUpdater != nil {
-				_, podIP, podName := splitStatusCode(statusCode)
+				_, podIP, podName, internalID = splitStatusCode(statusCode)
 				if podName != "" && podIP != "" {
 					go func() {
 						if err := podStatusUpdater.MarkPodIdle(podName, podIP); err != nil {
-							log.Printf("error marking pod as idle: %s\n", err.Error())
+							log.Printf("[RequestID:%s, CustomInternalID: %s] error marking pod as idle: %s\n", reqID, internalID, err.Error())
 						}
 					}()
-					log.Printf("Pod %s marked as idle with IP %s\n", podName, podIP)
+					log.Printf("[RequestID:%s, CustomInternalID: %s] Pod %s marked as idle with IP %s\n", reqID, internalID, podName, podIP)
 				}
 
 			}
@@ -238,12 +241,12 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
 	}
 }
 
-func splitStatusCode(statusCode string) (string, string, string) {
+func splitStatusCode(statusCode string) (string, string, string, string) {
 	parts := strings.Split(statusCode, "+")
 	if len(parts) < 3 {
-		return statusCode, "", ""
+		return statusCode, "", "", ""
 	}
-	return parts[0], parts[1], parts[2]
+	return parts[0], parts[1], parts[2], parts[3]
 }
 
 // SA - randomID generates a random ID for tracing purposes
@@ -351,7 +354,9 @@ func forwardRequest(w http.ResponseWriter,
 	serviceIP := res.Header.Get("X-OpenFaaS-Backend-IP")
 	// podIP := res.Header.Get("X-OpenFaaS-Pod-IP")
 	podName := res.Header.Get("X-OpenFaaS-Pod-Name")
-	statusCode := code + "+" + serviceIP + "+" + podName
+	// SA -  get the internal ID from the response header
+	internalID := res.Header.Get("X-OpenFaaS-Internal-ID")
+	statusCode := code + "+" + serviceIP + "+" + podName + "+" + internalID
 
 	return statusCode, nil
 }
