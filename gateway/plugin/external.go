@@ -553,13 +553,23 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 	// Extract the base service name from the function name
 	requestedMemory, requestedCPU := uint64(512), uint64(1)
 	baseName := serviceName // Default to the original service name
-	if strings.Contains(serviceName, "-") {
-		parts := strings.Split(serviceName, "-")
-		if len(parts) >= 3 {
-			baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
-			requestedMemory, _ = strconv.ParseUint(parts[1], 10, 64)
-			requestedCPU, _ = strconv.ParseUint(parts[2], 10, 64)
-		}
+	// if strings.Contains(serviceName, "-") {
+	// 	parts := strings.Split(serviceName, "-")
+	// 	if len(parts) >= 3 {
+	// 		baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
+	// 		requestedMemory, _ = strconv.ParseUint(parts[1], 10, 64)
+	// 		requestedCPU, _ = strconv.ParseUint(parts[2], 10, 64)
+	// 	}
+	// }
+	// Use a regex to extract the base name and version parts
+	// The regex matches the pattern: function-Name-{memory}-{CPU}
+	versionRegex := regexp.MustCompile(`^(.+)-(\d+)-(\d+)$`)
+	matches := versionRegex.FindStringSubmatch(serviceName)
+
+	if len(matches) == 4 {
+		// Deployment follows naming convention
+		baseName = matches[1]
+
 	}
 	log.Printf("[FindAlternativeVersion] Base service name: %s", baseName)
 	log.Printf("[FindAlternativeVersion] Checking for available versions of function: %s in namespace: %s", serviceName, serviceNamespace)
@@ -615,8 +625,9 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 
 	if len(matchedFunctions) == 0 {
 		log.Printf("[FindAlternativeVersion] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
-		return matchedFunctions, fmt.Errorf("[FindAlternativeVersion] no alternative function version found for %s in namespace %s",
-			serviceName, serviceNamespace)
+		// return matchedFunctions, fmt.Errorf("[FindAlternativeVersion] no alternative function version found for %s in namespace %s",
+		// serviceName, serviceNamespace)
+		return nil, nil // No alternative function version found, return nil
 	}
 	// Sort matched functions by score (lower is better)
 	sort.Slice(matchedFunctions, func(i, j int) bool {
@@ -681,14 +692,26 @@ func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceN
 		var requestedMemory, requestedCPU int
 		baseName := serviceName     // Default to the original service name
 		originalName := serviceName // Store the original name for annotations
-		if strings.Contains(serviceName, "-") {
-			parts := strings.Split(serviceName, "-")
-			if len(parts) >= 3 {
-				baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
-				requestedMemory, _ = strconv.Atoi(parts[1])
-				requestedCPU, _ = strconv.Atoi(parts[2])
-			}
+		versionRegex := regexp.MustCompile(`^(.+)-(\d+)-(\d+)$`)
+		matches := versionRegex.FindStringSubmatch(serviceName)
+
+		// fix the regex to match the function name with memory and CPU
+		// e.g., function-Name-512-1000
+		if len(matches) == 4 {
+			// Deployment follows naming convention
+			baseName = matches[1]
+			requestedMemory, _ = strconv.Atoi(matches[2])
+			requestedCPU, _ = strconv.Atoi(matches[3])
+
 		}
+		// if strings.Contains(serviceName, "-") {
+		// 	parts := strings.Split(serviceName, "-")
+		// 	if len(parts) >= 3 {
+		// 		baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
+		// 		requestedMemory, _ = strconv.Atoi(parts[1])
+		// 		requestedCPU, _ = strconv.Atoi(parts[2])
+		// 	}
+		// }
 		log.Printf("[DeployFunctionWithResources] Base service name: %s", baseName)
 
 		if baseName != serviceName && requestedMemory > 0 && requestedCPU > 0 {
