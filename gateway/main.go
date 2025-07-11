@@ -191,8 +191,8 @@ func main() {
 	faasHandlers.ScaleFunction = scaling.MakeHorizontalScalingHandler(handlers.MakeForwardingProxyHandler(reverseProxy, forwardingNotifiers, urlResolver, nilURLTransformer, serviceAuthInjector, nil))
 
 	// SA - Add the proxy for the error based scaling endpoint
-	// errorBasedScaling := handlers.MakeNotifierWrapper(
-	// 	handlers.MakeErrorBasedScalingHandler(prometheusQuery, faasHandlers.Alert, config.Namespace, 2, 1, 15), quietNotifier)
+	errorBasedScaling := handlers.MakeNotifierWrapper(
+		handlers.MakeErrorBasedScalingHandler(prometheusQuery, faasHandlers.Alert, config.Namespace, 2, 1, 15), quietNotifier)
 
 	if credentials != nil {
 		faasHandlers.Alert =
@@ -219,8 +219,8 @@ func main() {
 			auth.DecorateWithBasicAuth(faasHandlers.NamespaceListerHandler, credentials)
 		faasHandlers.NamespaceMutatorHandler =
 			auth.DecorateWithBasicAuth(faasHandlers.NamespaceMutatorHandler, credentials)
-		// errorBasedScaling =
-		// 	auth.DecorateWithBasicAuth(errorBasedScaling, credentials)
+		errorBasedScaling =
+			auth.DecorateWithBasicAuth(errorBasedScaling, credentials)
 	}
 
 	r := mux.NewRouter()
@@ -234,7 +234,7 @@ func main() {
 	r.HandleFunc("/system/telemetry", faasHandlers.TelemetryHandler).Methods(http.MethodGet)
 
 	// SA - Add the error based scaling endpoint both for scale up and scale down
-	// r.HandleFunc("/system/scale-on-errors", errorBasedScaling).Methods(http.MethodPost)
+	r.HandleFunc("/system/scale-on-errors", errorBasedScaling).Methods(http.MethodPost)
 	r.HandleFunc("/system/alert", faasHandlers.Alert).Methods(http.MethodPost)
 
 	r.HandleFunc("/system/function/{name:["+NameExpression+"]+}", faasHandlers.FunctionStatus).Methods(http.MethodGet)
