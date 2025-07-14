@@ -591,8 +591,8 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 			if !podFound {
 				continue // skip the function if it has no idle pods
 			}
-			log.Printf("[FindAlternativeVersion] Found alternative function version: %s with available memory: %s and cpu: %s",
-				fn.Name, fn.Requests.Memory, fn.Requests.CPU)
+			// log.Printf("[FindAlternativeVersion] Found alternative function version: %s with available memory: %s and cpu: %s",
+			// 	fn.Name, fn.Requests.Memory, fn.Requests.CPU)
 			// If we found a function with the same base name, use its configuration
 			var memory, cpu uint64
 			if fn.Requests != nil {
@@ -605,8 +605,21 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 			if cpu == 0 && fn.Limits != nil {
 				cpu, _ = strconv.ParseUint(fn.Limits.CPU, 10, 64)
 			}
+
+			// Only consider the function if it has enough available resources
+			if memory >= requestedMemory && cpu >= requestedCPU {
+				log.Printf("[FindAlternativeVersion] Found alternative function version: %s with memory: %dMB, CPU: %d cores",
+					fn.Name, memory, cpu)
+			} else {
+				log.Printf("[FindAlternativeVersion] Skipping function version: %s with memory: %dMB, CPU: %d cores, as it does not meet the requested resources",
+					fn.Name, memory, cpu)
+				continue // Skip this function if it does not meet the requested resources
+			}
 			// Calculate the score based on the difference between requested and available resources
-			// score := abs(memory, requestedMemory) + abs(cpu, requestedCPU)
+			// SA - Use a custom scoring function to score the alternative function version
+			// The score is calculated based on the difference between requested and available resources
+			// The lower the score, the better the alternative function version
+			// score = abs(memory - requestedMemory) + abs(cpu - requestedCPU)
 			score := ScorePodAlternative(memory, requestedMemory, cpu, requestedCPU)
 
 			matchedFunctions = append(matchedFunctions, struct {
