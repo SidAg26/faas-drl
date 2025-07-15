@@ -5,8 +5,8 @@ import (
 	"log"
 	"strconv"
 	"strings"
-	"time"
 	"sync" // SA - Added sync package for concurrency safety
+	"time"
 
 	"github.com/openfaas/faas/gateway/metrics"
 	"github.com/openfaas/faas/gateway/pkg/middleware"
@@ -23,7 +23,7 @@ import (
 // It includes details such as request ID, HTTP method, URL, original URL, status code, event type, and duration
 // Change the statusCode type from int to string to accommodate custom status codes
 type HTTPNotifier interface {
-    Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration)
+	Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration)
 }
 
 func urlToLabel(path string) string {
@@ -89,7 +89,6 @@ func (LoggingNotifier) Notify(requestID string, method string, URL string, origi
 	}
 }
 
-
 // SA - Log of changes:
 // Required files are:
 // - handlers/notifiers.go
@@ -97,48 +96,52 @@ func (LoggingNotifier) Notify(requestID string, method string, URL string, origi
 // - handlers/notifier_handler.go
 // - main.go
 
-
 // SA - CustomLoggingNotifier logs unique request details
 // CustomLoggingNotifier logs unique request details with a request ID
 // These would be available in the container logs for debugging purposes
 type CustomLoggingNotifier struct {
-    mu       sync.Mutex
-    requests map[string]time.Time
+	mu       sync.Mutex
+	requests map[string]time.Time
 }
 
 func NewCustomLoggingNotifier() *CustomLoggingNotifier {
-    return &CustomLoggingNotifier{
-        requests: make(map[string]time.Time),
-    }
+	return &CustomLoggingNotifier{
+		requests: make(map[string]time.Time),
+	}
 }
 
 // SA - Include the requestId in the interface
 func (n *CustomLoggingNotifier) Notify(requestID string, method string, URL string, originalURL string, statusCode string, event string, duration time.Duration) {
-    // requestID := fmt.Sprintf("%s-%s-%d", method, originalURL, time.Now().UnixNano())
+	// requestID := fmt.Sprintf("%s-%s-%d", method, originalURL, time.Now().UnixNano())
 
-    n.mu.Lock()
-    defer n.mu.Unlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-    if event == "started" {
-        n.requests[requestID] = time.Now()
-        log.Printf("[CustomNotifier] START: ID=%s Method=%s Path=%s Time=%s", requestID, method, originalURL, n.requests[requestID].Format(time.RFC3339Nano))
-    } else if event == "completed" {
-        startTime, ok := n.requests[requestID]
-        endTime := time.Now()
-        if !ok {
-            startTime = endTime.Add(-duration)
-        }
+	if event == "started" {
+		n.requests[requestID] = time.Now()
+		log.Printf("[CustomNotifier] START: ID=%s Method=%s Path=%s Time=%s", requestID, method, originalURL, n.requests[requestID].Format(time.RFC3339Nano))
+	} else if event == "completed" {
+		startTime, ok := n.requests[requestID]
+		endTime := time.Now()
+		if !ok {
+			startTime = endTime.Add(-duration)
+		}
 		// SA - Extract status code and IP from StatusIP string
-        parts := strings.Split(statusCode, "+")
-        statusCode, _ := strconv.Atoi(parts[0])
-        backendIP := parts[1]
+		parts := strings.Split(statusCode, "+")
+		statusCode, _ := strconv.Atoi(parts[0])
+		var backendIP string
+		if len(parts) < 2 {
+			backendIP = "unknown"
+		} else {
+			backendIP = parts[1]
+		}
 
-        log.Printf("[CustomNotifier] END: ID=%s Method=%s Path=%s Status=%d Start=%s End=%s Duration=%.4fs BackendIP=%s",
-            requestID, method, originalURL, statusCode,
-            startTime.Format(time.RFC3339Nano),
-            endTime.Format(time.RFC3339Nano),
-            duration.Seconds(),
+		log.Printf("[CustomNotifier] END: ID=%s Method=%s Path=%s Status=%d Start=%s End=%s Duration=%.4fs BackendIP=%s",
+			requestID, method, originalURL, statusCode,
+			startTime.Format(time.RFC3339Nano),
+			endTime.Format(time.RFC3339Nano),
+			duration.Seconds(),
 			backendIP)
-        delete(n.requests, requestID)
-    }
+		delete(n.requests, requestID)
+	}
 }
