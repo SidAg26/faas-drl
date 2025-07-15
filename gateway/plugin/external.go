@@ -15,7 +15,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log" // SA - Importing math/rand to use random number generation
+	"log"       // SA - Importing math/rand to use random number generation
+	"math/rand" // SA - Importing math/rand to use random number generation
 	"net"
 	"net/http"
 	"net/url"
@@ -214,6 +215,26 @@ func (s *ExternalServiceQuery) GetReplicasCustom(serviceName, serviceNamespace s
 		// -----------------------------------------------
 		// SA - 2. Check for alternative function versions - Resource Reused
 		// -----------------------------------------------
+		if podFound && function.AvailableReplicas == 0 {
+			log.Printf("[GetReplicasCustom] Function %s has no idle pods - stale cache returned. Finding alternatives", function.Name)
+			// If the function has no idle pods, we need to find alternatives
+			functions, err = s.GetFunctionList(serviceNamespace)
+			if err != nil {
+				log.Printf("[GetReplicasCustom] Error fetching function list: %v", err)
+				return emptyServiceQueryResponse, err
+			}
+			alternateVersionList, err := s.FindAlternativeFunctionVersion(serviceName, serviceNamespace, functions)
+			if err != nil {
+				log.Printf("[GetReplicasCustom] Error finding alternative function version: %v", err)
+				return emptyServiceQueryResponse, err
+			}
+			if alternateVersionList != nil {
+				index := rand.Intn(len(alternateVersionList))
+				return prepareVersionResponse(alternateVersionList[index])
+			}
+			log.Printf("[GetReplicasCustom] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
+			// return emptyServiceQueryResponse, fmt.Errorf("no alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
+		}
 		if !podFound {
 			// SA - No idle pods found, look for alternative solutions
 			// Score and Select the cheapest alternative solutions
@@ -230,7 +251,8 @@ func (s *ExternalServiceQuery) GetReplicasCustom(serviceName, serviceNamespace s
 				return emptyServiceQueryResponse, err
 			}
 			if alternateVersionList != nil {
-				return prepareVersionResponse(alternateVersionList[0])
+				index := rand.Intn(len(alternateVersionList))
+				return prepareVersionResponse(alternateVersionList[index])
 			}
 			// SA - No idle pods found and no alternative function version found
 			log.Printf("[GetReplicasCustom] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
@@ -571,7 +593,7 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 		baseName = matches[1]
 
 	}
-	log.Printf("[FindAlternativeVersion] Base service name: %s", baseName)
+	log.Printf("[FindAlternativeVersion] Base service name: %s as expected", baseName)
 	log.Printf("[FindAlternativeVersion] Checking for available versions of function: %s in namespace: %s", serviceName, serviceNamespace)
 
 	pattern := fmt.Sprintf(`^%s-\d+-\d+$`, regexp.QuoteMeta(baseName))
@@ -594,17 +616,8 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 			// log.Printf("[FindAlternativeVersion] Found alternative function version: %s with available memory: %s and cpu: %s",
 			// 	fn.Name, fn.Requests.Memory, fn.Requests.CPU)
 			// If we found a function with the same base name, use its configuration
-			var memory, cpu uint64
-			if fn.Requests != nil {
-				memory, _ = strconv.ParseUint(fn.Requests.Memory, 10, 64)
-				cpu, _ = strconv.ParseUint(fn.Requests.CPU, 10, 64)
-			}
-			if memory == 0 && fn.Limits != nil {
-				memory, _ = strconv.ParseUint(fn.Limits.Memory, 10, 64)
-			}
-			if cpu == 0 && fn.Limits != nil {
-				cpu, _ = strconv.ParseUint(fn.Limits.CPU, 10, 64)
-			}
+			// Extract memory and CPU from the function requests and limits
+			memory, cpu := extractMemoryAndCPU(fn)
 
 			// Only consider the function if it has enough available resources
 			if memory >= requestedMemory && cpu >= requestedCPU {
@@ -648,6 +661,66 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 	})
 
 	return matchedFunctions, nil
+}
+
+func extractMemoryAndCPU(fn types.FunctionStatus) (uint64, uint64) {
+	var memory, cpu uint64
+	// Extract memory and CPU from the function requests and limits
+	// Check for the format of memory and CPU in the function requests and limits
+	// If the memory is in the form "512Mi" or "1Gi", we need to convert it to Mi
+	// If the CPU is in the form "1000m" or "1", we need to convert it to millicores
+
+	if fn.Requests != nil {
+		// Check for memory in the function requests
+		if strings.HasSuffix(fn.Requests.Memory, "Mi") {
+			memory, _ = strconv.ParseUint(strings.TrimSuffix(fn.Requests.Memory, "Mi"), 10, 64)
+		} else if strings.HasSuffix(fn.Requests.Memory, "Gi") {
+			memory, _ = strconv.ParseUint(strings.TrimSuffix(fn.Requests.Memory, "Gi"), 10, 64)
+			memory *= 1024 // Convert Gi to Mi
+		} else {
+			memory, _ = strconv.ParseUint(fn.Requests.Memory, 10, 64)
+		}
+		// Check for CPU in the function requests
+		if strings.HasSuffix(fn.Requests.CPU, "m") {
+			cpu, _ = strconv.ParseUint(strings.TrimSuffix(fn.Requests.CPU, "m"), 10, 64)
+		} else if strings.HasSuffix(fn.Requests.CPU, "cores") {
+			cpu, _ = strconv.ParseUint(strings.TrimSuffix(fn.Requests.CPU, "cores"), 10, 64)
+			cpu *= 1000 // Convert cores to millicores
+		} else {
+			cpu, _ = strconv.ParseUint(fn.Requests.CPU, 10, 64)
+		}
+	}
+	if memory == 0 && fn.Limits != nil {
+		if strings.HasSuffix(fn.Limits.Memory, "Mi") {
+			memory, _ = strconv.ParseUint(strings.TrimSuffix(fn.Limits.Memory, "Mi"), 10, 64)
+		} else if strings.HasSuffix(fn.Limits.Memory, "Gi") {
+			memory, _ = strconv.ParseUint(strings.TrimSuffix(fn.Limits.Memory, "Gi"), 10, 64)
+			memory *= 1024 // Convert Gi to Mi
+		} else {
+			memory, _ = strconv.ParseUint(fn.Limits.Memory, 10, 64)
+		}
+	}
+	if cpu == 0 && fn.Limits != nil {
+		if strings.HasSuffix(fn.Limits.CPU, "m") {
+			cpu, _ = strconv.ParseUint(strings.TrimSuffix(fn.Limits.CPU, "m"), 10, 64)
+		} else if strings.HasSuffix(fn.Limits.CPU, "cores") {
+			cpu, _ = strconv.ParseUint(strings.TrimSuffix(fn.Limits.CPU, "cores"), 10, 64)
+			cpu *= 1000 // Convert cores to millicores
+		} else {
+			cpu, _ = strconv.ParseUint(fn.Limits.CPU, 10, 64)
+		}
+	}
+	// If memory or CPU is still 0, set it to a default value
+	if memory == 0 {
+		memory = 512 // Default to 512 MiB if not specified
+	}
+	if cpu == 0 {
+		cpu = 1000 // Default to 1 core (1000 millicores) if not specified
+	}
+	log.Printf("[extractMemoryAndCPU] Extracted memory: %d MiB, CPU: %d millicores from function: %s",
+		memory, cpu, fn.Name)
+	// Return the extracted memory and CPU values
+	return memory, cpu
 }
 
 // Helper function to get the function list
