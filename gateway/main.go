@@ -191,8 +191,9 @@ func main() {
 	faasHandlers.ScaleFunction = scaling.MakeHorizontalScalingHandler(handlers.MakeForwardingProxyHandler(reverseProxy, forwardingNotifiers, urlResolver, nilURLTransformer, serviceAuthInjector, nil))
 
 	// SA - Add the proxy for the error based scaling endpoint
+	// SA - Added cooldown for pod failure handling if needed
 	errorBasedScaling := handlers.MakeNotifierWrapper(
-		handlers.MakeErrorBasedScalingHandler(prometheusQuery, faasHandlers.Alert, config.Namespace, 2, 1, 15), quietNotifier)
+		handlers.MakeErrorBasedScalingHandler(prometheusQuery, faasHandlers.Alert, config.Namespace, 2, 1, 15, 30*time.Second), quietNotifier)
 
 	if credentials != nil {
 		faasHandlers.Alert =
