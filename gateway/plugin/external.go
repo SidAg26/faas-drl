@@ -468,7 +468,7 @@ func prepareVersionResponse(function struct {
 
 // SA - GetFunctionPodStatus retrieves the pod status for a specific function
 func (s *ExternalServiceQuery) GetFunctionPodStatus(functionName, functionNamespace string) (bool, error) {
-
+	timeStart := time.Now()
 	key := fmt.Sprintf("%s-%s", "GetFunctionPodStatus", functionName)
 	result, err, _ := s.deployGroup.Do(key, func() (interface{}, error) {
 		urlPath := fmt.Sprintf("%ssystem/podstatus/query?functionName=%s&namespace=%s",
@@ -542,7 +542,7 @@ func (s *ExternalServiceQuery) GetFunctionPodStatus(functionName, functionNamesp
 				return false, nil
 			}
 		}
-
+		log.Printf("[GetFunctionPodStatus] [%s.%s] took: %.4fs", functionName, functionNamespace, time.Since(timeStart).Seconds())
 		// No idle pods found, return false to indicate that the function is busy
 		return false, nil
 	})
@@ -570,7 +570,7 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 		CPU      uint64
 		Score    uint64
 	}
-
+	timeStart := time.Now()
 	// Look for a function with the same base name and a version suffix
 	// Extract the base service name from the function name
 	requestedMemory, requestedCPU := uint64(512), uint64(1)
@@ -653,13 +653,14 @@ func (s *ExternalServiceQuery) FindAlternativeFunctionVersion(serviceName string
 		log.Printf("[FindAlternativeVersion] No alternative function version found for %s in namespace %s", serviceName, serviceNamespace)
 		// return matchedFunctions, fmt.Errorf("[FindAlternativeVersion] no alternative function version found for %s in namespace %s",
 		// serviceName, serviceNamespace)
+		log.Printf("[FindAlternativeVersion] [%s.%s] took: %.4fs", serviceName, serviceNamespace, time.Since(timeStart).Seconds())
 		return nil, nil // No alternative function version found, return nil
 	}
 	// Sort matched functions by score (lower is better)
 	sort.Slice(matchedFunctions, func(i, j int) bool {
 		return matchedFunctions[i].Score < matchedFunctions[j].Score
 	})
-
+	log.Printf("[FindAlternativeVersion] [%s.%s] took: %.4fs", serviceName, serviceNamespace, time.Since(timeStart).Seconds())
 	return matchedFunctions, nil
 }
 
@@ -765,9 +766,14 @@ func (s *ExternalServiceQuery) GetFunctionList(serviceNamespace string) ([]types
 }
 
 // SA - DeployFunctionWithResources creates a new function deployment with specified resources
+// Add these as package-level variables at the top of the file
+var (
+	versionRegex = regexp.MustCompile(`^(.+)-(\d+)-(\d+)$`)
+)
+
 func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceNamespace string,
 	functions []types.FunctionStatus) (scaling.ServiceQueryResponse, error) {
-
+	timeStart := time.Now()
 	var emptyServiceQueryResponse scaling.ServiceQueryResponse
 
 	// Use singleflight to ensure that only one deployment request is processed at a time
@@ -778,7 +784,8 @@ func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceN
 		var requestedMemory, requestedCPU int
 		baseName := serviceName     // Default to the original service name
 		originalName := serviceName // Store the original name for annotations
-		versionRegex := regexp.MustCompile(`^(.+)-(\d+)-(\d+)$`)
+		
+		// Use pre-compiled regex
 		matches := versionRegex.FindStringSubmatch(serviceName)
 
 		// fix the regex to match the function name with memory and CPU
@@ -788,29 +795,22 @@ func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceN
 			baseName = matches[1]
 			requestedMemory, _ = strconv.Atoi(matches[2])
 			requestedCPU, _ = strconv.Atoi(matches[3])
-
 		}
-		// if strings.Contains(serviceName, "-") {
-		// 	parts := strings.Split(serviceName, "-")
-		// 	if len(parts) >= 3 {
-		// 		baseName = parts[0] // this is to match other versions like "functionName-{memory}-{CPU}"
-		// 		requestedMemory, _ = strconv.Atoi(parts[1])
-		// 		requestedCPU, _ = strconv.Atoi(parts[2])
-		// 	}
-		// }
+		
 		log.Printf("[DeployFunctionWithResources] Base service name: %s", baseName)
 
 		if baseName != serviceName && requestedMemory > 0 && requestedCPU > 0 {
 			log.Printf("[DeployFunctionWithResources] Deploying new function version with memory=%dMB, CPU=%d cores",
 				requestedMemory, requestedCPU)
 		}
+		
 		// 1. Get the original function definition (if it exists)
 		var originalFunction types.FunctionStatus
-		// baseName is just the name of the function without any resource suffix
-		// therefore, first find any existing function with the same base name
+		// Optimize function search by creating pattern once
 		pattern := fmt.Sprintf(`^%s-\d+-\d+$`, regexp.QuoteMeta(baseName))
 		re := regexp.MustCompile(pattern)
 
+		// Use map for faster lookup if functions list is large
 		for _, fn := range functions {
 			if fn.Name == baseName {
 				continue // skip the original function
@@ -856,12 +856,14 @@ func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceN
 		// 3. Deploy the new function
 		deployBody, err := json.Marshal(deployReq)
 		if err != nil {
+			log.Printf("[DeployFunctionWithResources] Error marshalling deploy request: %v", err)
 			return emptyServiceQueryResponse, err
 		}
 
 		deployURL := fmt.Sprintf("%ssystem/functions", s.URL.String())
 		deployReqRes, err := http.NewRequest(http.MethodPost, deployURL, bytes.NewReader(deployBody))
 		if err != nil {
+			log.Printf("[DeployFunctionWithResources] Error creating deploy request: %v", err)
 			return emptyServiceQueryResponse, err
 		}
 
@@ -902,6 +904,7 @@ func (s *ExternalServiceQuery) DeployFunctionWithResources(serviceName, serviceN
 		log.Printf("[DeployFunctionWithResources] Error deploying function with resources: %v", err)
 		return emptyServiceQueryResponse, err
 	}
+	log.Printf("[DeployFunctionWithResources] [%s.%s] took: %.4fs", serviceName, serviceNamespace, time.Since(timeStart).Seconds())
 	// Return the result from the singleflight group
 	return result.(scaling.ServiceQueryResponse), nil
 }
