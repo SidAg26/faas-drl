@@ -51,11 +51,15 @@ func MakeScalingHandler(next http.HandlerFunc, scaler scaling.FunctionScaler, co
 		baseName := extractBaseFunctionName(functionName)
 		configName, memory, cpu, err := getMemFigLessPrediction(baseName, body)
 		if err != nil {
-			log.Printf("Error getting MemFigLess prediction: %s\n", err)
-			http.Error(w, "Internal Server Error while getting MemFigLess prediction", http.StatusInternalServerError)
-			return
+			// SA - A Fallback mechanism to handle prediction errors
+			// If we fail to get the prediction, we log the error and continue
+			// without modifying the function name.
+			// This allows the request to proceed with the original function name.
+			log.Printf("Error getting MemFigLess prediction: %s, Trying [BESTEFFORT] with %s\n", err, functionName)
+			// http.Error(w, "Internal Server Error while getting MemFigLess prediction", http.StatusInternalServerError)
+			// return
 		}
-		if configName != "" {
+		if err == nil && configName != "" {
 			log.Printf("[ScalingMemFigLess] Using MemFigLess prediction for function %s: %s, memory: %d, cpu: %d\n",
 				functionName, configName, memory, cpu)
 			functionName = configName
